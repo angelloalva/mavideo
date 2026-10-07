@@ -9,6 +9,7 @@ Aqui cada proveedor tiene su prueba, elegida para que NO cueste dinero:
 
     openai     GET /v1/models              autentica; no genera nada
     cartesia   GET /voices                 lista voces; no sintetiza nada
+    elevenlabs GET /v1/voices/{voz}        lee la voz clonada; no sintetiza nada
     jamendo    GET /tracks/?limit=1        una busqueda; el plan es gratuito
     freesound  GET /search/text/?page_size=1   idem
     claude     salud_cli.probar por cuenta  (haiku, una palabra: es lo minimo)
@@ -25,10 +26,12 @@ import os
 import re
 
 try:
-    from . import claves, salud_cli
+    from . import claves, salud_cli, vertex_cfg, voz_proveedor
 except ImportError:  # ejecutado con la carpeta pasos en sys.path
     import claves
     import salud_cli
+    import vertex_cfg
+    import voz_proveedor
 
 RAIZ_ESTUDIO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -86,8 +89,11 @@ def _texto_corto(respuesta):
                 return str(error["message"])[:300]
             if isinstance(error, str):
                 return error[:300]
-            if datos.get("detail"):
-                return str(datos["detail"])[:300]
+            detalle = datos.get("detail")
+            if isinstance(detalle, dict) and detalle.get("message"):
+                return str(detalle["message"])[:300]
+            if detalle:
+                return str(detalle)[:300]
             if datos.get("message"):
                 return str(datos["message"])[:300]
     except ValueError:
@@ -134,6 +140,68 @@ def probar_cartesia(clave):
                                          f"({respuesta.status_code}): {_texto_corto(respuesta)}")
     return _ficha("cartesia", "mal", f"Cartesia contesta {respuesta.status_code}: "
                                      f"{_texto_corto(respuesta)}")
+
+
+def _sin_permiso(respuesta):
+    """Si el 401 de ElevenLabs es de permisos (clave valida) y no de clave mala."""
+    try:
+        detalle = (respuesta.json() or {}).get("detail")
+    except ValueError:
+        return False
+    return isinstance(detalle, dict) and detalle.get("status") == "missing_permissions"
+
+
+def probar_elevenlabs(clave, voz_id=""):
+    """La clave y, si hay, la voz: GET de la voz no gasta ningun credito."""
+    if not clave:
+        return _ficha("elevenlabs", "sin_clave", "no hay clave de ElevenLabs puesta")
+    cabeceras = {"xi-api-key": clave}
+    if voz_id:
+        respuesta, fallo = _pedir("GET", f"https://api.elevenlabs.io/v1/voices/{voz_id}",
+                                  headers=cabeceras)
+    else:
+        respuesta, fallo = _pedir("GET", "https://api.elevenlabs.io/v1/user",
+                                  headers=cabeceras)
+    if respuesta is None:
+        return _ficha("elevenlabs", "sin_red",
+                      f"no se ha podido hablar con ElevenLabs: {fallo}")
+    if respuesta.status_code == 200:
+        if not voz_id:
+            return _ficha("elevenlabs", "mal", "la clave autentica, pero falta el "
+                                               "id de la voz con la que locutar")
+        try:
+            nombre = str((respuesta.json() or {}).get("name") or "")
+        except ValueError:
+            nombre = ""
+        return _ficha("elevenlabs", "ok",
+                      "la clave autentica y la voz existe"
+                      + (f": «{nombre}»" if nombre else ""))
+    if respuesta.status_code in (401, 403) and _sin_permiso(respuesta):
+        # UNA CLAVE CON PERMISOS RECORTADOS AUTENTICA. ElevenLabs deja crear
+        # claves que solo sintetizan; a esas les falta `voices_read` y contestan
+        # 401 con status `missing_permissions`. La clave es buena --locuta--,
+        # solo que no deja mirar la voz sin gastar creditos. Medido el
+        # 27-09-2026 con la clave del canal.
+        return _ficha("elevenlabs", "ok",
+                      "la clave autentica. Es una clave con permisos limitados "
+                      "(no deja leer las voces), así que la voz no se puede "
+                      "comprobar sin gastar créditos: se ve al generar el audio")
+    if respuesta.status_code in (401, 403):
+        return _ficha("elevenlabs", "mal", f"ElevenLabs no reconoce la clave "
+                                           f"({respuesta.status_code}): "
+                                           f"{_texto_corto(respuesta)}")
+    try:
+        detalle = (respuesta.json() or {}).get("detail") or {}
+    except Exception:
+        detalle = {}
+    if isinstance(detalle, dict) and detalle.get("code") == "invalid_api_key":
+        return _ficha("elevenlabs", "mal", f"La clave de ElevenLabs no es válida: {detalle.get('message') or _texto_corto(respuesta)}")
+    if respuesta.status_code == 404 and voz_id:
+        return _ficha("elevenlabs", "mal", f"La voz {voz_id} no existe en esa cuenta de ElevenLabs. Asegúrate de añadirla primero a 'My Voices' / VoiceLab en ElevenLabs.")
+    if respuesta.status_code in (400, 404) and voz_id:
+        return _ficha("elevenlabs", "mal", f"ElevenLabs rechaza la petición ({respuesta.status_code}): {_texto_corto(respuesta)}")
+    return _ficha("elevenlabs", "mal", f"ElevenLabs contesta {respuesta.status_code}: "
+                                       f"{_texto_corto(respuesta)}")
 
 
 def probar_jamendo(clave):
@@ -222,6 +290,25 @@ def probar_todas(cuentas_claude=(), con_claude=True):
             nombre = funcion.__name__.replace("probar_", "")
             fichas.append(_ficha(nombre, "sin_red", f"la prueba ha fallado: "
                                                      f"{type(fallo).__name__}: {fallo}"))
+    # Google Vertex (las imagenes con Nano Banana), si hay cuenta de servicio
+    if vertex_cfg.leer()["cuenta"]:
+        try:
+            ficha = vertex_cfg.probar()
+            fichas.append(_ficha("vertex", ficha.get("estado", "mal"),
+                                 ficha.get("mensaje", "")))
+        except Exception as fallo:                     # noqa: BLE001
+            fichas.append(_ficha("vertex", "sin_red", f"la prueba ha fallado: "
+                                                      f"{type(fallo).__name__}: {fallo}"))
+    # ElevenLabs vive en su propio fichero (secretos/elevenlabs.json), no en
+    # el almacen; solo se prueba si hay algo puesto
+    eleven = voz_proveedor.configuracion()
+    if str(eleven.get("clave") or "").strip():
+        try:
+            fichas.append(probar_elevenlabs(str(eleven.get("clave")).strip(),
+                                            str(eleven.get("voz_id") or "").strip()))
+        except Exception as fallo:                     # noqa: BLE001
+            fichas.append(_ficha("elevenlabs", "sin_red", f"la prueba ha fallado: "
+                                                          f"{type(fallo).__name__}: {fallo}"))
     if con_claude:
         try:
             fichas.extend(probar_claude(cuentas_claude))
@@ -232,6 +319,7 @@ def probar_todas(cuentas_claude=(), con_claude=True):
 
 
 NOMBRES = {"openai": "OpenAI (imágenes)", "cartesia": "Cartesia (voz)",
+           "elevenlabs": "ElevenLabs (voz)", "vertex": "Google Vertex (imágenes)",
            "jamendo": "Jamendo (música)", "freesound": "FreeSound (efectos)",
            "claude": "Claude"}
 

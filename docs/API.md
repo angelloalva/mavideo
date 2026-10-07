@@ -113,6 +113,14 @@ Reglas que valen para toda la API y no se repiten en cada fila:
 | | Ruta | Qué hace |
 |---|---|---|
 | `GET` | `/api/proyectos/{pid}/assets/hechos` | Los planos que hay generados AHORA en la carpeta de trabajo. |
+| `GET` | `/api/proyectos/{pid}/render/mirilla` | El ultimo fotograma de cada plano que se esta dibujando AHORA. |
+| `PUT` | `/api/proyectos/{pid}/texto` | «Texto en pantalla» de ESTE video: van a los params de los rotulos. |
+| `GET` | `/api/proyectos/{pid}/publicar` | Los creditos que pide la musica y los efectos, y la ficha si ya se hizo. |
+| `POST` | `/api/proyectos/{pid}/publicar` | Pide al CLI titulos, descripcion y etiquetas. Va por la suscripcion. |
+| `GET` | `/api/proyectos/{pid}/flow` | Cuantas imagenes de Google Flow hay, cuantas faltan y cuantas esperan en Descargas. |
+| `POST` | `/api/proyectos/{pid}/flow/exportar` | Vuelve a escribir los prompts de Flow; con `sugerir`, pide otra frase de estilo. |
+| `GET` | `/api/proyectos/{pid}/flow/tanda.json` | El fichero que carga la extension de Chrome en Flow. |
+| `POST` | `/api/proyectos/{pid}/flow/importar` | Trae de la carpeta de descargas lo nuevo o rehecho. No lanza nada. |
 | `GET` | `/api/proyectos/{pid}/catalogo` | El catalogo APROBADO que hay guardado en los params de assets. |
 | `PUT` | `/api/proyectos/{pid}/catalogo` | Guarda el catalogo aprobado en los params de assets. |
 | `POST` | `/api/proyectos/{pid}/catalogo/proponer` | Lee el guion ENTERO y propone quien sale, donde y con que tono. |
@@ -231,6 +239,12 @@ Reglas que valen para toda la API y no se repiten en cada fila:
 | `POST` | `/api/claves/cli/{cid}/probar` | Le habla a esa cuenta con una llamada mínima y apunta cómo responde. |
 | `POST` | `/api/claves/cli/{cid}/salir` | Cierra la sesión de esa cuenta, sin quitarla de la lista. |
 | `POST` | `/api/claves/probar` | Prueba cada clave contra su servicio y dice cuál funciona de verdad. |
+| `GET` | `/api/voz/proveedor` | Cartesia o ElevenLabs, y lo puesto de ElevenLabs (la clave, tapada). |
+| `PUT` | `/api/voz/proveedor` | Cambia de proveedor o guarda la clave, la voz y el modelo de ElevenLabs. |
+| `POST` | `/api/voz/proveedor/probar` | Prueba la clave de ElevenLabs sin gastar creditos. |
+| `GET` | `/api/imagenes/vertex` | La cuenta de servicio de Google Vertex (sin su clave), el modelo y donde. |
+| `PUT` | `/api/imagenes/vertex` | Sube la clave .json de la cuenta de servicio o cambia modelo/ubicacion. |
+| `POST` | `/api/imagenes/vertex/probar` | Habla con Vertex sin generar ninguna imagen (countTokens no se cobra). |
 
 ## El asistente
 

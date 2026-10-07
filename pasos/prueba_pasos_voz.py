@@ -690,6 +690,9 @@ def main():
         print("(sin CARTESIA_API_KEY: se omite lo que sale a la red. Ponla en "
               "Configuracion para probar el catalogo y una toma real)")
     os.environ["ESTUDIO_SIMULAR"] = "1"
+    # lo que se comprueba aqui es Cartesia: ElevenLabs (secretos/elevenlabs.json)
+    # queda apagado para que la suite no gaste sus creditos
+    os.environ["ESTUDIO_SIN_ELEVENLABS"] = "1"
     base = tempfile.mkdtemp(prefix="estudio_voz_")
     # EL HISTORICO, A UNA COPIA. Esta suite sale a Cartesia de verdad con frases
     # de DIEZ palabras y anota su cadencia: en el historico real esas muestras

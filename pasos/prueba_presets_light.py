@@ -183,28 +183,26 @@ def probar_ritmo():
 
     # RELLENA LOS CAMPOS QUE YA EXISTEN, no inventa ninguno
     cambios = light.params_de_ritmo("rapido")
-    igual(sorted(cambios), ["assets", "voz"],
-          "el ritmo escribe en assets y en voz, y en ningun sitio mas")
+    igual(sorted(cambios), ["assets"],
+          "el ritmo escribe en assets y en ningun sitio mas: la voz no la toca")
     igual(sorted(cambios["assets"]), ["max_s", "min_s", "min_s_rotulos"],
           "en assets, los tres campos de duracion del modo editor")
-    igual(sorted(cambios["voz"]), ["hueco_minimo"],
-          "y en voz solo el aire: la VELOCIDAD la pone quien lee tu encargo")
+    ok(all(light.params_de_ritmo(r["id"]) == {"assets": light.params_de_ritmo(r["id"])["assets"]}
+           for r in light.RITMOS),
+       "ningun ritmo escribe velocidad ni aire en la voz")
     import p6_assets
     for clave in cambios["assets"]:
         ok(clave in p6_assets.PARAMS_POR_DEFECTO,
            f"«{clave}» es un param que el paso de assets ya tenia")
-    for clave in cambios["voz"]:
-        ok(clave in p4_voz.resolver_params({}),
-           f"«{clave}» es un param que el paso de voz ya tenia")
+    ficha = light.ficha_de_ritmo("muy_lento")
+    ok(9 <= ficha["imagenes_por_minuto"] <= 10,
+       f"muy lento son ~10 imagenes por minuto: {ficha['imagenes_por_minuto']}")
 
     # y las claves caen dentro de lo que un preset de canal sabe guardar
     import presets_canal
     for clave in cambios["assets"]:
         ok(clave in presets_canal.TIPOS["estilo"]["claves"],
            f"«{clave}» la guarda el preset de estilo")
-    for clave in cambios["voz"]:
-        ok(clave in presets_canal.TIPOS["voz"]["claves"],
-           f"«{clave}» la guarda el preset de voz")
     ok("ritmo" in presets_canal.CLAVES_ORIGEN,
        "y el ritmo elegido se guarda en el origen del preset")
 

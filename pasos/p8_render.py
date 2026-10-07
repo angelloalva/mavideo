@@ -49,6 +49,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cartelas  # noqa: E402
 import estadisticas  # noqa: E402
+import flow  # noqa: E402
 import medios  # noqa: E402
 import sonido  # noqa: E402
 import transiciones  # noqa: E402
@@ -167,7 +168,7 @@ class Navegador:
             stdout=subprocess.DEVNULL, stderr=self._registro,
             **medios.SIN_VENTANA)
         try:
-            self.ws = websocket.create_connection(self._url_pestana(), timeout=60)
+            self.ws = websocket.create_connection(self._url_pestana(), timeout=300)
             self._id = 0
             self.rAF = True
             self.llamar("Page.enable")
@@ -427,6 +428,59 @@ def _pagina_de(escena, mov, capa_svg, hyper, p, destino, capa_fija="", fps=30):
             .replace("__MOV__", json.dumps({"ventana_ini": mov["ventana_ini"],
                                             "ventana_fin": mov["ventana_fin"]}))
             .replace("__FPS__", str(int(fps)))
+            .replace("__DUR__", f"{duracion:.4f}"))
+    return medios.escribir_texto(destino, html)
+
+
+PAGINA_VIDEO = """<!doctype html><html><head><meta charset="utf-8"><style>
+html,body{margin:0;padding:0;background:#0b0c09;overflow:hidden}
+#lienzo{position:relative;width:__W__px;height:__H__px;overflow:hidden}
+#camara{position:absolute;left:0;top:0;width:__W__px;height:__H__px}
+#fondo{display:block;width:__W__px;height:__H__px;object-fit:cover}
+#capa{position:absolute;left:0;top:0;width:__W__px;height:__H__px}
+#capa > svg{width:__W__px;height:__H__px;display:block}
+#camara{z-index:0}
+#capafija{position:absolute;left:0;top:0;width:__W__px;height:__H__px;z-index:1}
+#capafija > svg{width:__W__px;height:__H__px;display:block}
+</style></head><body>
+<div id="lienzo">
+  <div id="camara">
+    <img id="fondo" src="f00001.png">
+    <div id="capa">__CAPA__</div>
+  </div>
+  <div id="capafija">__CAPAFIJA__</div>
+</div>
+<script>
+const DUR = __DUR__, FPS = __FPS__, TOTAL = __TOTAL__;
+const fondo = document.getElementById('fondo');
+const svg = document.querySelector('#capa svg');
+const svgFijo = document.querySelector('#capafija svg');
+if (svg && svg.pauseAnimations) svg.pauseAnimations();
+if (svgFijo && svgFijo.pauseAnimations) svgFijo.pauseAnimations();
+
+async function pintar(t){
+  const idx = Math.min(TOTAL, Math.max(1, Math.floor(t * FPS) + 1));
+  fondo.src = 'f' + String(idx).padStart(5, '0') + '.png';
+  if (fondo.decode) {
+    try { await fondo.decode(); } catch(e){}
+  }
+  if (svg && svg.setCurrentTime) svg.setCurrentTime(t);
+  if (svgFijo && svgFijo.setCurrentTime) svgFijo.setCurrentTime(t);
+  return 1;
+}
+pintar(0);
+</script></body></html>"""
+
+
+def _pagina_video_de(escena, capa_svg, capa_fija, p, destino, fps=30, total=1):
+    ancho, alto = [int(v) for v in p["resolucion"]]
+    duracion = float(escena["t_out"]) - float(escena["t_in"])
+    html = (PAGINA_VIDEO
+            .replace("__W__", str(ancho)).replace("__H__", str(alto))
+            .replace("__CAPA__", capa_svg or "")
+            .replace("__CAPAFIJA__", capa_fija or "")
+            .replace("__FPS__", str(int(fps)))
+            .replace("__TOTAL__", str(int(total)))
             .replace("__DUR__", f"{duracion:.4f}"))
     return medios.escribir_texto(destino, html)
 
@@ -766,6 +820,43 @@ def _python():
     return ejecutable
 
 
+def _max_lotes_por_ram():
+    """Tope de procesos de captura segun la memoria fisica de la maquina.
+
+    Cada instancia de Edge headless con WebGL y FFmpeg consume ~700MB-1GB de RAM.
+    En maquinas con 16 GB o menos de RAM, lanzar mas de 3 o 4 instancias causa
+    paginacion severa a disco (swapping) y timeouts de WebSocket por congelacion.
+    """
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                gb = stat.ullTotalPhys / (1024 ** 3)
+                if gb <= 16.5:
+                    return 3
+                if gb <= 24.5:
+                    return 4
+                if gb <= 32.5:
+                    return 6
+    except Exception:
+        pass
+    return 4
+
+
 def _cuantos_lotes(p, cuantos_planos):
     """Cuantos procesos de captura correr a la vez."""
     pedidos = int(p.get("lotes") or LOTES_A_LA_VEZ)
@@ -783,7 +874,9 @@ def _cuantos_lotes(p, cuantos_planos):
         forzado = 0
     if forzado > 0:
         return max(1, min(forzado, MAX_LOTES, cuantos_planos))
-    return max(1, min(MAX_LOTES, (os.cpu_count() or 2) // 2, cuantos_planos))
+    limite_ram = _max_lotes_por_ram()
+    hilos = (os.cpu_count() or 2) // 2
+    return max(1, min(MAX_LOTES, limite_ram, hilos, cuantos_planos))
 
 
 def _repartir_lotes(pendientes, cuantos):
@@ -868,16 +961,109 @@ def renderizar_plano(tarea, navegador=None):
     fps = int(tarea["fps"])
     total = int(tarea["frames"])
     carpeta = tarea["carpeta"]
-    # SE VACIA, NO SE BORRA: el mismo Edge acaba de tener abiertos como textura
-    # los PNG del plano anterior de este lote, y borrar la carpeta con un handle
-    # vivo dentro la deja en BORRADO PENDIENTE -- existe para `os.path.exists`,
-    # `makedirs(exist_ok=True)` no hace nada, y desaparece a mitad del bucle de
-    # fotogramas. Ver `medios.rehacer_carpeta`.
+    ancho, alto = [int(v) for v in tarea["resolucion"]]
+    dur_target = total / float(fps)
+    corte = tarea.get("corte") or {}
+    anterior = tarea.get("anterior")
+    hay_transicion = bool(anterior and transiciones.cuece_el_anterior(corte))
+    hay_capa = bool(tarea.get("capa") and tarea["capa"].strip())
+    hay_capafija = bool(tarea.get("capa_fija") and tarea["capa_fija"].strip())
+
+    video_manual = tarea.get("video_manual")
+    if not video_manual and tarea.get("raiz_proyecto"):
+        video_manual = flow.buscar_video_de_escena(
+            tarea.get("raiz_proyecto"), sid, flow_num=tarea.get("flow_num"))
+
+    # CAMINO A: VIDEO MANUAL / FLOW
+    if video_manual and os.path.isfile(video_manual):
+        # VIA RAPIDA: sin subtitulo, sin cartela y sin transicion con el anterior
+        if not hay_capa and not hay_capafija and not hay_transicion:
+            ajustes = CALIDADES.get(tarea["calidad"]) or CALIDADES["media"]
+            filtro_vf = (f"scale={ancho}:{alto}:force_original_aspect_ratio=decrease,"
+                         f"pad={ancho}:{alto}:(ow-iw)/2:(oh-ih)/2:black,fps={fps},"
+                         f"tpad=stop_mode=clone:stop_duration=60")
+            cmd = [
+                medios.ffmpeg(), "-y", "-loglevel", "error",
+                "-i", video_manual,
+                "-vf", filtro_vf,
+                "-t", f"{dur_target:.3f}",
+                "-c:v", "libx264", "-preset", ajustes["preset"], "-crf", ajustes["crf"],
+                "-pix_fmt", "yuv420p", "-r", str(fps), "-an",
+                tarea["clip"]
+            ]
+            proceso = subprocess.run(cmd, capture_output=True, text=True, timeout=1200, **medios.SIN_VENTANA)
+            if proceso.returncode != 0 or not os.path.exists(tarea["clip"]):
+                raise RuntimeError(f"ffmpeg fallo conformando video en {tarea['clip']}: {proceso.stderr[-400:]}")
+            # Extraer ultimo fotograma para la transicion del plano siguiente
+            cmd_last = [
+                medios.ffmpeg(), "-y", "-loglevel", "error",
+                "-sseof", "-0.1", "-i", tarea["clip"],
+                "-update", "1", "-frames:v", "1", tarea["ultimo"]
+            ]
+            subprocess.run(cmd_last, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, **medios.SIN_VENTANA)
+            return {"id": sid, "frames": total,
+                    "duracion": round(dur_target, 3),
+                    "transicion": corte.get("tipo") or "corte",
+                    "ranura": corte.get("ranura") or "corte",
+                    "frames_transicion": 0,
+                    "origen": "flow_video"}
+
+        # VIA COMPLETA CON OVERLAYS / TRANSICION
+        medios.rehacer_carpeta(carpeta)
+        filtro_vf = (f"scale={ancho}:{alto}:force_original_aspect_ratio=decrease,"
+                     f"pad={ancho}:{alto}:(ow-iw)/2:(oh-ih)/2:black,fps={fps},"
+                     f"tpad=stop_mode=clone:stop_duration=60")
+        cmd_frames = [
+            medios.ffmpeg(), "-y", "-loglevel", "error",
+            "-i", video_manual,
+            "-vf", filtro_vf,
+            "-t", f"{dur_target:.3f}",
+            "-r", str(fps),
+            os.path.join(carpeta, "f%05d.png")
+        ]
+        proceso = subprocess.run(cmd_frames, capture_output=True, text=True, timeout=1200, **medios.SIN_VENTANA)
+        if proceso.returncode != 0:
+            raise RuntimeError(f"ffmpeg fallo extrayendo frames de video en {carpeta}: {proceso.stderr[-400:]}")
+
+        # Si hay subtitulos o cartela, se pintan con Edge sobre cada frame
+        if (hay_capa or hay_capafija) and navegador:
+            pagina = _pagina_video_de(tarea["escena"], tarea.get("capa") or "",
+                                      tarea.get("capa_fija") or "",
+                                      {"resolucion": tarea["resolucion"]},
+                                      os.path.join(carpeta, "escena.html"),
+                                      fps=fps, total=total)
+            navegador.abrir(pagina)
+            for numero in range(total):
+                navegador.pintar(numero / float(fps))
+                navegador.capturar(os.path.join(carpeta, f"f{numero + 1:05d}.png"))
+            medios.borrar(pagina)
+
+        ultimo_png = os.path.join(carpeta, f"f{total:05d}.png")
+        if os.path.exists(ultimo_png):
+            _guardar_ultimo(ultimo_png, tarea["ultimo"])
+
+        pintados = 0
+        if hay_transicion and navegador:
+            listo = True
+            if tarea.get("esperar_anterior"):
+                listo = _esperar(anterior, tarea["desde"])
+            if listo and os.path.exists(anterior):
+                pintados = _cocer_transicion(navegador, tarea["pagina_trans"],
+                                             anterior, carpeta, total, fps, corte)
+
+        _codificar(carpeta, tarea["clip"], fps, tarea["calidad"])
+        if not tarea.get("conservar_frames"):
+            shutil.rmtree(carpeta, ignore_errors=True)
+        return {"id": sid, "frames": total,
+                "duracion": round(dur_target, 3),
+                "transicion": corte.get("tipo") or "corte",
+                "ranura": corte.get("ranura") or "corte",
+                "frames_transicion": pintados,
+                "origen": "flow_video"}
+
+    # CAMINO B: RENDER ESTANDAR CON IMAGEN FIJA
     resisten = medios.rehacer_carpeta(carpeta)
     if resisten:
-        # Un PNG viejo que sobrevive dentro de la secuencia f00001..fNNNNN se
-        # colaria en el clip: se dice, con su nombre, en vez de renderizar
-        # encima y descubrirlo mirando el video.
         print(f"[render] {sid}: {len(resisten)} fichero(s) de la pasada anterior "
               f"siguen bloqueados en {carpeta} ({os.path.basename(resisten[0])}…)",
               flush=True)
@@ -890,26 +1076,14 @@ def renderizar_plano(tarea, navegador=None):
     for numero in range(total):
         navegador.pintar(numero / float(fps))
         navegador.capturar(os.path.join(carpeta, f"f{numero + 1:05d}.png"))
-    # El ultimo fotograma se guarda ANTES de la transicion: es el que mira el
-    # plano siguiente, y lo que tiene que mirar es este plano limpio, no este
-    # plano mezclado con el anterior.
     _guardar_ultimo(os.path.join(carpeta, f"f{total:05d}.png"), tarea["ultimo"])
 
-    corte = tarea.get("corte") or {}
     pintados = 0
-    anterior = tarea.get("anterior")
-    if anterior and transiciones.cuece_el_anterior(corte):
-        # el plano de antes puede estar renderizandose en otro proceso: su
-        # ultimo fotograma es la senal de que ya se puede mezclar con el
+    if hay_transicion:
         listo = True
         if tarea.get("esperar_anterior"):
             listo = _esperar(anterior, tarea["desde"])
             if not listo:
-                # SE DICE, no se calla. Antes daba igual porque la espera nunca
-                # fallaba (bastaba con que el fichero existiera); ahora un lote
-                # caido deja a su sucesor sin transicion, y un corte seco que
-                # aparece sin motivo es media hora buscando en el sitio que no
-                # es. El plano sale igual, con corte.
                 print(f"[render] {tarea['id']}: el plano anterior "
                       f"({tarea['previo']}) no ha dejado su ultimo fotograma en "
                       f"{ESPERA_ANTERIOR_S:.0f} s; este corte va sin transicion",
@@ -965,8 +1139,56 @@ def correr_lote(tareas, senal_vivo=None):
 LATIDO_S = 1.0
 
 
+def _fotogramas_frescos(tarea, desde):
+    """Cuantos fotogramas de este plano ha escrito ESTE render.
+
+    SOLO NOMBRES, sin mirar ficheros uno a uno: el render escribe cientos de
+    PNG por minuto y preguntarle al disco por cada uno cada segundo, mientras
+    los hijos los estan escribiendo, es justo lo que no hay que hacer. Se
+    listan los nombres y se mira la fecha de UNO (el ultimo), que basta para
+    saber si esa carpeta es de este render o la dejo uno anterior.
+
+    Un plano con su clip ya fresco cuenta entero: al cerrar el clip se borran
+    sus PNG (`conservar_frames`), asi que contarlos daria cero justo al acabar.
+    """
+    try:
+        if os.path.getmtime(tarea["clip"]) >= desde:
+            return int(tarea.get("frames") or 0)
+    except (OSError, KeyError):
+        pass
+    try:
+        nombres = [n for n in os.listdir(tarea["carpeta"]) if n.endswith(".png")]
+        if not nombres:
+            return 0
+        if os.path.getmtime(os.path.join(tarea["carpeta"], max(nombres))) < desde:
+            return 0
+    except (OSError, KeyError):
+        return 0
+    return min(len(nombres), int(tarea.get("frames") or len(nombres)))
+
+
+def _consola(texto):
+    """Una linea en la consola del servidor, para quien quiera mirar por debajo.
+
+    La barra de la pantalla dice lo mismo en publico; esto es la version
+    tecnica, con hora, ritmo y lo que queda, en la terminal donde corre
+    `app.py`. Si no hay consola (servicio sin terminal), no pasa nada.
+    """
+    try:
+        print(f"[render {time.strftime('%H:%M:%S')}] {texto}", flush=True)
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
+#: Cada cuanto se cuentan los fotogramas en disco (ver `_fotogramas_frescos`).
+CONTAR_CADA_S = 3.0
+
+#: Cada cuanto se escribe en consola aunque nada haya cambiado de forma visible.
+CONSOLA_CADA_S = 15.0
+
+
 def _vigilar_avance(dir_lotes, dir_clips, ids, cuantos_lotes, desde, avisar,
-                    parar):
+                    parar, tareas=None):
     """Cuenta lo que hay EN DISCO y mueve la barra. Corre en su propio hilo.
 
     POR QUE HACE FALTA, Y NO ES UN ADORNO. Se pulsaba «Generar el MP4» y la
@@ -995,11 +1217,25 @@ def _vigilar_avance(dir_lotes, dir_clips, ids, cuantos_lotes, desde, avisar,
     sitio donde esta.
     """
     ultimo = None
+    # POR FOTOGRAMAS, NO SOLO POR PLANOS (27-09-2026). Contar clips dejaba la
+    # barra minutos en «dibujando los primeros planos»: un plano de 6-8 s son
+    # ~200 fotogramas y el clip solo cae al final. Los PNG van cayendo uno a
+    # uno, asi que contarlos dice de verdad por donde va.
+    tareas = list(tareas or [])
+    total_fotos = sum(int(t.get("frames") or 0) for t in tareas)
+    en_consola = {"cuando": 0.0, "texto": ""}
+    contado = {"cuando": 0.0, "fotos": 0}
+    arranque = time.time()
     while not parar.is_set():
         try:
             vivos = len([n for n in os.listdir(dir_lotes) if n.endswith(".vivo")])
         except OSError:
             vivos = 0
+        # los fotogramas se cuentan cada CONTAR_CADA_S, no en cada latido
+        if total_fotos and time.time() - contado["cuando"] >= CONTAR_CADA_S:
+            contado["fotos"] = sum(_fotogramas_frescos(t, desde) for t in tareas)
+            contado["cuando"] = time.time()
+        fotos = contado["fotos"]
         frescos = 0
         for sid in ids:
             clip = os.path.join(dir_clips, f"{sid}.mp4")
@@ -1008,7 +1244,11 @@ def _vigilar_avance(dir_lotes, dir_clips, ids, cuantos_lotes, desde, avisar,
                     frescos += 1
             except OSError:
                 pass
-        if frescos:
+        if fotos and total_fotos:
+            mensaje = (f"{fotos} de {total_fotos} fotogramas · "
+                       f"{frescos} de {len(ids)} planos")
+            fraccion = 0.05 + 0.85 * (fotos / total_fotos)
+        elif frescos:
             mensaje = f"{frescos} de {len(ids)} planos renderizados"
             fraccion = 0.05 + 0.85 * (frescos / max(1, len(ids)))
         elif vivos >= cuantos_lotes:
@@ -1022,6 +1262,14 @@ def _vigilar_avance(dir_lotes, dir_clips, ids, cuantos_lotes, desde, avisar,
         if mensaje != ultimo:
             avisar(fraccion, mensaje)
             ultimo = mensaje
+        ahora = time.time()
+        if mensaje != en_consola["texto"] and ahora - en_consola["cuando"] >= CONSOLA_CADA_S:
+            ritmo = fotos / max(1.0, ahora - arranque)
+            falta = ((total_fotos - fotos) / ritmo) if ritmo > 0 and fotos else None
+            _consola(f"{mensaje} · {vivos} navegadores vivos"
+                     + (f" · {ritmo:.1f} fotogramas/s · quedan ~{falta / 60:.0f} min"
+                        if falta is not None else ""))
+            en_consola.update(cuando=ahora, texto=mensaje)
         parar.wait(LATIDO_S)
 
 
@@ -1046,6 +1294,10 @@ def _correr_lotes_en_procesos(lotes, trabajo, avisar, total_planos,
             encoding="utf-8", errors="replace", **medios.SIN_VENTANA)))
     avisar(0.02, f"{total_planos} planos en {len(lotes)} procesos: "
                  f"arrancando los navegadores")
+    _consola(f"{total_planos} planos, "
+             f"{sum(int(t.get('frames') or 0) for lote in lotes for t in lote)} "
+             f"fotogramas, en {len(lotes)} procesos (ESTUDIO_LOTES="
+             f"{os.environ.get('ESTUDIO_LOTES') or 'automatico'})")
 
     # LA BARRA LA MUEVE UN VIGILANTE, no la recogida. Ver `_vigilar_avance`: la
     # recogida solo puede hablar cuando un lote ENTERO termina, y eso son
@@ -1057,6 +1309,7 @@ def _correr_lotes_en_procesos(lotes, trabajo, avisar, total_planos,
         vigilante = threading.Thread(
             target=_vigilar_avance,
             args=(dir_lotes, dir_clips, ids, len(lotes), desde, avisar, parar),
+            kwargs={"tareas": [t for lote in lotes for t in lote]},
             daemon=True)
         vigilante.start()
 
@@ -1081,7 +1334,13 @@ def _correr_lotes_en_procesos(lotes, trabajo, avisar, total_planos,
                 if codigo != 0 or not resultado.get("planos"):
                     fallos.append((error or "").strip()[-600:]
                                   or f"el proceso del lote salio con {codigo}")
+                    # ENTERO en la consola: en la pantalla y en la bitacora
+                    # solo cabe la cola, y la causa suele estar arriba
+                    _consola(f"FALLA {os.path.basename(ficha)} (codigo {codigo}):\n"
+                             + ((error or "").strip()[-4000:] or "(sin salida)"))
                     continue
+                _consola(f"{os.path.basename(ficha)} terminado: "
+                         + ", ".join(p["id"] for p in resultado["planos"]))
                 for plano in resultado["planos"]:
                     salida[plano["id"]] = plano
                     hechos += 1
@@ -1101,6 +1360,67 @@ def _correr_lotes_en_procesos(lotes, trabajo, avisar, total_planos,
 #: Lo que este paso entiende como opcion DE ESTA INVOCACION (no es un param y
 #: no mueve la firma): volver a montar el MP4 sin tocar un solo clip.
 OPCIONES_EJECUCION = ("solo_montar",)
+
+
+def unidades_pendientes(proyecto, params):
+    """Devuelve las unidades que todavia no estan renderizadas o estan obsoletas."""
+    p = _con_defectos(params)
+    trabajo = proyecto.ruta_trabajo("render", crear=False)
+    if not os.path.isdir(trabajo):
+        return None
+    ruta_plan = (params or {}).get("plan") or medios.salida_de(
+        proyecto, "assets", claves=("plan",), patrones=(r"plan\.json",))
+    ruta_mov = (params or {}).get("movimiento") or medios.salida_de(
+        proyecto, "callouts", claves=("movimiento",), patrones=(r"movimiento\.json",))
+    if not ruta_plan or not ruta_mov or not os.path.exists(ruta_plan) or not os.path.exists(ruta_mov):
+        return None
+    plan = medios.leer_json(ruta_plan, {})
+    escenas = plan.get("escenas") or []
+    if not escenas:
+        return None
+
+    dir_clips = os.path.join(trabajo, "clips")
+    base_callouts = os.path.dirname(ruta_mov)
+    movimientos = {m["id"]: m for m in
+                   (medios.leer_json(ruta_mov, {}) or {}).get("movimientos", [])
+                   if m.get("id")}
+    tiempo_mov = os.path.getmtime(ruta_mov)
+    cortes = transiciones.resolver(escenas, p, semilla=(plan.get("semilla") or 0))
+
+    faltan = set()
+    for escena in escenas:
+        sid = escena["id"]
+        clip = os.path.join(dir_clips, f"{sid}.mp4")
+        if not os.path.exists(clip) or os.path.getsize(clip) < 1000:
+            faltan.add(f"escena:{sid}")
+            continue
+        mtime_clip = os.path.getmtime(clip)
+        if mtime_clip < tiempo_mov:
+            faltan.add(f"escena:{sid}")
+            continue
+        mov = movimientos.get(sid) or {}
+        hyper = mov.get("hyperframe")
+        hyper = (hyper if hyper and os.path.isabs(hyper)
+                 else os.path.join(base_callouts, hyper or ""))
+        if os.path.exists(hyper) and mtime_clip < os.path.getmtime(hyper):
+            faltan.add(f"escena:{sid}")
+            continue
+        vid_manual = flow.buscar_video_de_escena(
+            getattr(proyecto, "raiz", None), sid, flow_num=escena.get("flow_num"))
+        if vid_manual and os.path.exists(vid_manual):
+            if mtime_clip < os.path.getmtime(vid_manual):
+                faltan.add(f"escena:{sid}")
+                continue
+
+    originales = set(faltan)
+    for indice, escena in enumerate(escenas[1:], start=1):
+        prev_id = escenas[indice - 1]["id"]
+        curr_id = escena["id"]
+        if (f"escena:{prev_id}" in originales
+                and transiciones.cuece_el_anterior(cortes.get(curr_id))):
+            faltan.add(f"escena:{curr_id}")
+
+    return sorted(faltan)
 
 
 def ejecutar(proyecto, params, avisar=None, unidades=None, solo_montar=False):
@@ -1155,6 +1475,11 @@ def ejecutar(proyecto, params, avisar=None, unidades=None, solo_montar=False):
     cortes = transiciones.resolver(escenas, p,
                                    semilla=(plan.get("semilla") or 0))
     pedidas = set(unidades) if unidades is not None else None
+    if pedidas is None and not solo_montar and not (params or {}).get("rehacer"):
+        pend = unidades_pendientes(proyecto, p)
+        if pend is not None and len(pend) < len(escenas):
+            pedidas = set(pend)
+            _consola(f"retomando render: {len(escenas) - len(pedidas)} clips ya hechos, {len(pedidas)} por hacer")
     arrastrados = []
     if pedidas is not None:
         # EL UNICO ARRASTRE QUE SOBREVIVE, y no es «rehacer lo que depende»:
@@ -1261,7 +1586,12 @@ def ejecutar(proyecto, params, avisar=None, unidades=None, solo_montar=False):
             "previo": escenas[indice - 1]["id"] if indice else None,
             "corte": {k: v for k, v in (cortes.get(sid) or {}).items()},
             "pagina_trans": pagina_trans,
-            "conservar_frames": bool(p["conservar_frames"])})
+            "conservar_frames": bool(p["conservar_frames"]),
+            "video_manual": flow.buscar_video_de_escena(
+                getattr(proyecto, "raiz", None), sid, flow_num=escena.get("flow_num")),
+            "flow_num": escena.get("flow_num"),
+            "tipo_visual": escena.get("tipo_visual"),
+            "raiz_proyecto": getattr(proyecto, "raiz", None)})
 
     # QUIEN TIENE QUE ESPERAR A QUIEN. La transicion de un plano se cuece sobre
     # el ULTIMO FOTOGRAMA del anterior, asi que si ese plano tambien se

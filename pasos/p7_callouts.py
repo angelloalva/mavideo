@@ -73,6 +73,10 @@ PARAMS_POR_DEFECTO = {
     # feo: el enrutador del estilo grafico habria escrito ahi, el video habria
     # salido igual, y la correccion habria quedado marcada como aplicada.
     "subtitulo_caja": "auto",
+    # COMO ENTRA Y SALE cada trozo de subtitulo: "fundido" (0,3 s), "corte"
+    # (de golpe) o "auto", que es lo de siempre: fundido en horizontal y corte
+    # en vertical, donde los trozos duran poco. Se elige en «Texto en pantalla».
+    "subtitulo_animacion": "auto",
     # Set de estilo de diseno: dibujo | realista | editorial. Lo sugiere la guia
     # de estilo del video (ver diseno_sugerido) y se puede cambiar a mano.
     # Escrito y no DISENO_POR_DEFECTO porque los sets se declaran mas abajo:
@@ -725,9 +729,13 @@ def capa_fija_de(escena, p, banda=None, salida=SALIDA):
         cap_trozo=cap_trozo_subtitulo(cap_subtitulo(tam, banda), salida),
         texto=texto_subtitulo_de(p, f"escena:{escena.get('id')}"))
     tapa = opacidad_de_caja(p)
-    # en vertical sin fundidos: cada trozo dura poco y se lee entero
+    # en vertical sin fundidos: cada trozo dura poco y se lee entero. Salvo
+    # que se haya pedido otra cosa en «Texto en pantalla».
+    animacion = str(p.get("subtitulo_animacion") or "auto").strip().lower()
+    fundido = (animacion == "fundido" if animacion in ("fundido", "corte")
+               else not es_vertical(salida))
     piezas = [bloque_subtitulo(x, banda, tam, paleta, diseno, tapa,
-                               fundido=not es_vertical(salida))
+                               fundido=fundido)
               for x in trozos]
     fichas = [{"tipo": "subtitulo", "texto": x["texto"],
                "desde": x["desde"], "hasta": x["hasta"]} for x in trozos]

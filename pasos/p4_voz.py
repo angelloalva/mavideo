@@ -139,6 +139,39 @@ class _MotorVoz:
 
 
 motor = _MotorVoz()
+
+
+class _MotorEleven:
+    """El motor de ElevenLabs, recargado igual que el de Cartesia."""
+
+    def __getattr__(self, nombre):
+        return getattr(comun.cargar_motor("voz_elevenlabs", "voz.py"), nombre)
+
+
+motor_eleven = _MotorEleven()
+
+
+def elevenlabs_activo():
+    """True si secretos/elevenlabs.json pide locutar con ElevenLabs."""
+    try:
+        return bool(motor_eleven.activo())
+    except Exception:                                         # noqa: BLE001
+        return False
+
+
+def _es_eleven(cfg):
+    return (cfg or {}).get("proveedor") == "elevenlabs"
+
+
+def _toma_elevenlabs(trozos, cfg, progreso):
+    """Los trozos en ElevenLabs -> (wav, duracion, palabras), como Cartesia."""
+    limpios = [marcas_tts.para_elevenlabs(t) for t in trozos]
+    return comun.llamar_motor(
+        motor_eleven.locutar, limpios, voz_id=cfg["voz_id"],
+        modelo=cfg["modelo"], idioma=cfg.get("idioma") or "es",
+        ajustes=cfg.get("voice_settings") or None, progreso=progreso)
+
+
 #: La frecuencia de muestreo de la API. Se resuelve UNA vez a proposito: no
 #: cambia entre versiones del motor y se usa en aritmetica en todo el fichero.
 SR = motor.SR
@@ -357,7 +390,7 @@ def resolver_params(params):
     if hueco < 0:
         raise ValueError("hueco_minimo no puede ser negativo")
 
-    return {
+    cfg = {
         "preset": nombre_preset or None,
         "modelo": modelo,
         "voz_id": voz_id,
@@ -369,6 +402,34 @@ def resolver_params(params):
         "generation_config": construir_generation_config(velocidad, emociones),
         "controles_por": ("generation_config" if usa_generation_config(modelo)
                           else "experimental_controls"),
+    }
+    if elevenlabs_activo():
+        cfg.update(_cfg_elevenlabs(velocidad))
+    return cfg
+
+
+def _cfg_elevenlabs(velocidad):
+    """Lo que cambia en la configuracion cuando locuta ElevenLabs.
+
+    La voz y el modelo salen de secretos/elevenlabs.json, NO de los params del
+    proyecto: alli hay ids de Cartesia. Las emociones no existen en ElevenLabs
+    y se ignoran; la velocidad se traduce a su rango (0,7 .. 1,2).
+
+    Solo se anade cuando esta activo: la revision de audio compara estas
+    claves con las de la toma grabada, y meterlas siempre daria por caducadas
+    todas las tomas de Cartesia.
+    """
+    fichero = motor_eleven.configuracion()
+    ajustes = dict(fichero.get("voice_settings") or {})
+    speed = _speed_sonic3(velocidad)
+    if speed is not None and "speed" not in ajustes:
+        ajustes["speed"] = round(max(motor_eleven.SPEED_MIN,
+                                     min(motor_eleven.SPEED_MAX, speed)), 3)
+    return {
+        "proveedor": "elevenlabs",
+        "modelo": str(fichero.get("modelo") or motor_eleven.MODELO_POR_DEFECTO),
+        "voz_id": str(fichero.get("voz_id") or "").strip(),
+        "voice_settings": ajustes,
     }
 
 
@@ -756,6 +817,8 @@ def _toma_por_contexto(trozos, cfg, progreso):
     Suena como la toma unica porque la prosodia se mantiene entre entradas; lo
     que se gana es saber donde empieza y acaba cada seccion dentro del audio.
     """
+    if _es_eleven(cfg):
+        return _toma_elevenlabs(trozos, cfg, progreso)
     import websocket  # websocket-client; solo hace falta por este camino
 
     api_key = comun.llamar_motor(motor.cargar_api_key)
@@ -821,6 +884,8 @@ def _toma_por_contexto(trozos, cfg, progreso):
 
 def _toma_real(texto, cfg, progreso):
     """Llamada SSE a Cartesia con __experimental_controls."""
+    if _es_eleven(cfg):
+        return _toma_elevenlabs([texto], cfg, progreso)
     # cargar_api_key aborta con SystemExit, que dentro de un hilo del gestor de
     # trabajos no lo recoge nadie
     api_key = comun.llamar_motor(motor.cargar_api_key)
@@ -1001,6 +1066,10 @@ def sintetizar_bloques(bloques, destino, cfg, avisar=None,
         try:
             wav, duracion, palabras = _toma_por_contexto(trozos, cfg, progreso)
         except Exception as fallo:  # noqa: BLE001
+            # En ElevenLabs no hay "camino de siempre": reintentar de una vez
+            # seria volver a pagar lo mismo por el mismo sitio. Se para.
+            if _es_eleven(cfg):
+                raise
             # Que el camino nuevo falle no puede dejar sin voz al video: se cae
             # al de siempre, que es el mismo texto de una sola vez.
             avisa(0.06, f"el contexto no ha ido ({fallo}); se graba de una vez")

@@ -269,6 +269,31 @@ def limpiar(texto):
     return " ".join(plano.split())
 
 
+#: Tope de <break> en ElevenLabs (multilingual_v2 y flash): 3 s.
+ELEVENLABS_BREAK_MAX_S = 3.0
+
+
+def para_elevenlabs(texto):
+    """El texto YA SANEADO, en el dialecto de ElevenLabs.
+
+    ElevenLabs solo entiende <break time="1.2s" />: las pausas se conservan
+    (pasadas a segundos) y todo lo demas -- velocidad, volumen, emocion -- se
+    quita, porque alli no existe y podria acabar locutado. <spell> se queda en
+    su contenido, que es lo mismo que deja limpiar() y lo que espera el reparto.
+    """
+    def pausa(m):
+        segundos = _numero(m.group(1)) / (1000.0 if m.group(2).lower() == "ms" else 1.0)
+        segundos = _acotar(segundos, 0.1, ELEVENLABS_BREAK_MAX_S)
+        return f' <break time="{segundos:.1f}s" /> '
+
+    plano = str(texto or "")
+    plano = _SPELL.sub(lambda m: m.group(1), plano)
+    plano = _BREAK.sub(pausa, plano)
+    plano = _RATIO.sub(" ", plano)
+    plano = _EMOCION.sub(" ", plano)
+    return " ".join(plano.split())
+
+
 def hay_marcas(texto):
     """True si el texto lleva alguna anotacion de voz."""
     return bool(_ALGO_ASI.search(str(texto or "")))

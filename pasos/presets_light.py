@@ -113,6 +113,8 @@ TAREAS = [
     {"id": "referencias", "nombre": "Las referencias de estilo",
      "necesita": ["guia"], "segundos": 120, "paso": "moodboard", "tamano": 6,
      "cuesta": True, "imagenes": 6,
+     # con las imagenes de Google Flow no se dibujan: ver `imagenes_con_flow`
+     "sin_flow": True,
      "porque": "genera una cara, unos cuerpos, un interior y un objeto en ese "
                "estilo: es lo que después copia cada plano"},
     {"id": "grafismo", "nombre": "El grafismo",
@@ -233,8 +235,10 @@ def imagenes_de_parte(parte, encargo=None):
     donde esta el precio.
     """
     ficha = PARTES.get(parte) or {}
+    flow = imagenes_con_flow()
     return sum(int((TAREAS_POR_ID.get(t) or {}).get("imagenes") or 0)
-               for t in ficha.get("tareas", ()))
+               for t in ficha.get("tareas", ())
+               if not (flow and (TAREAS_POR_ID.get(t) or {}).get("sin_flow")))
 
 
 #: CAMBIAR EL IDIOMA NO ES REHACER EL ESTILO, y por eso no esta en PARTES: no
@@ -315,7 +319,7 @@ def aviso_de_idioma(anterior, nuevo, calidad="medium"):
 # corte en planos. Rellena lo que alli se escribe a mano.
 #
 #     min_s, max_s, min_s_rotulos   la horquilla de duracion de un plano
-#     velocidad, hueco_minimo       de la voz -- y con reglas distintas, ver abajo
+#     velocidad, hueco_minimo       de la voz -- YA NO: ver `params_de_ritmo`
 #
 # LOS NUMEROS NO SON REDONDOS, SON LOS QUE EL MOTOR PUEDE CUMPLIR. Dos limites
 # del segmentador (motores/guion/segmentar.py) mandan sobre lo que se pida aqui:
@@ -383,7 +387,10 @@ def ritmo_de(id_ritmo):
 #: estilo, el reparto y la continuidad-- y no la imagen devuelta, que en `low`
 #: son seis milesimas. Por eso subir la calidad no multiplica el coste: le suma
 #: la diferencia de salida (0,041 y 0,165 $ segun tarifas.json).
-USD_POR_IMAGEN = {"low": 0.033, "medium": 0.074, "high": 0.198}
+USD_POR_IMAGEN = {"low": 0.033, "medium": 0.074, "high": 0.198,
+                  # Nano Banana en Vertex: ~1.290 tokens de salida a 30 $/M mas
+                  # la entrada (motores/imagen_vertex/vertex.py)
+                  "vertex": 0.04}
 
 
 def coste_por_minuto(id_ritmo, calidad="low"):
@@ -411,9 +418,11 @@ def params_de_ritmo(id_ritmo):
     return {
         "assets": {"min_s": ficha["min_s"], "max_s": ficha["max_s"],
                    "min_s_rotulos": ficha["min_s_rotulos"]},
-        # la velocidad NO va aqui: la pone `voz_descrita` y solo si no la
-        # pediste tu. El aire si, que es de montaje y no de la voz.
-        "voz": {"hueco_minimo": ficha["hueco_minimo"]},
+        # LA VOZ NO VA AQUI, NI LA VELOCIDAD NI EL AIRE ENTRE BLOQUES. El ritmo
+        # decide cada cuanto cambia la imagen y nada mas: la voz es la del
+        # canal (a menudo una voz clonada) y tiene que sonar igual a cualquier
+        # ritmo. Decidido por el canal el 27-09-2026; hasta entonces «Muy
+        # lento» tambien ralentizaba la voz y alargaba las pausas.
     }
 
 
@@ -449,6 +458,9 @@ def ficha_de_ritmo(id_ritmo, calidad="low"):
     """El ritmo tal y como lo ensena la pantalla: solo dos cifras."""
     ficha = dict(ritmo_de(id_ritmo))
     ficha["usd_por_minuto"] = coste_por_minuto(ficha["id"], calidad)
+    # con las imagenes hechas a mano (Google Flow) lo que cuesta no son
+    # dolares sino imagenes que hacer: la pantalla ensena esta cifra
+    ficha["imagenes_por_minuto"] = round(60.0 / max(0.5, float(ficha["media_s"])), 1)
     return ficha
 
 class ErrorEncargo(ValueError):
@@ -594,13 +606,33 @@ def max_imagenes_estilo():
     return p6_assets.REFERENCIAS_A_ELEGIR
 
 
+def imagenes_con_flow():
+    """Si los videos se hacen con imagenes de Google Flow (ajuste global).
+
+    Con Flow no se dibujan las laminas de referencia: sirven para adjuntarlas
+    a cada imagen que se le pide a OpenAI, y en Flow no se le pide ninguna. El
+    estilo lo pone la frase de estilo de `pasos/flow.py`. Se lee aqui, y no se
+    pasa en el encargo, porque rehacer una parte de un estilo antiguo tampoco
+    puede ponerse a pagar laminas.
+    """
+    try:
+        try:
+            from . import ajustes
+        except ImportError:
+            import ajustes
+        return ajustes.imagenes_con_flow()
+    except Exception:                                         # noqa: BLE001
+        return False
+
+
 def tareas_de(encargo, solo=None):
     """Las tareas que aplican a este encargo, en orden de declaracion.
 
     `solo` recorta a un subconjunto (los tres botones de feedback), arrastrando
     lo que dependa de ello dentro del propio subconjunto.
     """
-    tareas = list(TAREAS)
+    tareas = [t for t in TAREAS
+              if not (t.get("sin_flow") and imagenes_con_flow())]
     if solo is not None:
         pedidas = set(solo)
         tareas = [t for t in tareas if t["id"] in pedidas]

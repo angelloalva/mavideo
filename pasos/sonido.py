@@ -107,6 +107,22 @@ def _claves():
             if k in ("JAMENDO_CLIENT_ID", "FREESOUND_API_KEY")}
 
 
+def licencia_comercial(url):
+    """Si la licencia deja usar el audio en un video monetizado.
+
+    Solo CC0 y CC BY. Lo demas se cae por algo concreto: NC prohibe el uso
+    comercial; ND prohibe obras derivadas, y poner musica bajo un video lo es;
+    SA obligaria a publicar el video entero con esa misma licencia. Sampling+
+    (Freesound) tambien excluye el uso comercial. CC BY pide atribucion: los
+    creditos del render ya salen listos para la descripcion.
+    """
+    u = (url or "").lower()
+    if "publicdomain/zero" in u:
+        return True
+    m = re.search(r"/licenses/([a-z+-]+)/", u)
+    return bool(m) and m.group(1) == "by"
+
+
 def hay_claves():
     """Si se puede salir a buscar. Renderizar NO lo necesita: eso lee del banco."""
     claves = _claves()
@@ -171,6 +187,12 @@ PAPELES = {
         "consultas": ("typewriter single key press", "typewriter key click",
                       "mechanical keyboard single click"),
         "duracion": (0.05, 0.6), "ganancia": 0.32, "cuantos": 4,
+    },
+    "tecla_digital": {
+        "nombre": "Clic digital sutil",
+        "descripcion": "Pulsación digital suave para textos o cartelas modernas.",
+        "consultas": ("ui click subtle", "digital tap button click", "soft ui mouse click"),
+        "duracion": (0.02, 0.4), "ganancia": 0.20, "cuantos": 4,
     },
     "retorno": {
         "nombre": "Retorno de carro",
@@ -303,8 +325,9 @@ def buscar_musica(animo="sobrio", duracion_s=0, cuantas=12, velocidad="low",
     if extra:
         etiquetas = f"{etiquetas} {extra}".strip()
     tope = max(1, min(50, int(cuantas)))
+    # se pide de sobra: la mayor parte de Jamendo es NC y se queda por el camino
     comun = {"client_id": claves["JAMENDO_CLIENT_ID"], "format": "json",
-             "limit": tope * 2, "include": "musicinfo licenses",
+             "limit": min(200, max(100, tope * 15)), "include": "musicinfo licenses",
              "boost": "popularity_total"}
     if instrumental:
         comun["vocalinstrumental"] = "instrumental"
@@ -319,15 +342,33 @@ def buscar_musica(animo="sobrio", duracion_s=0, cuantas=12, velocidad="low",
         # vale ofrecer algo del genero que una lista vacia
         {"fuzzytags": etiquetas.split()[0] if etiquetas.split() else "ambient",
          "speed": velocidad},
+        # Y TRES MAS, POR EL FILTRO DE LICENCIA. Solo pasan CC0 y CC BY (ver
+        # `licencia_comercial`) y la mayor parte de Jamendo es NC, asi que con
+        # la escalera de arriba un animo y una velocidad concretos se quedaban
+        # en CERO a menudo -- medido el 27-09: 11 de 24 combinaciones -- y un
+        # tramo sin tema para el montaje entero. Mas vale algo del genero sin
+        # la velocidad pedida, o algo neutro, que un video sin montar.
+        {"fuzzytags": etiquetas.split()[0] if etiquetas.split() else "ambient"},
+        {"fuzzytags": "cinematic"},
+        {"fuzzytags": "ambient"},
+        {"tags": "soundtrack"},
+        {"tags": "instrumental"},
     ]
     vistos, salida = set(), []
     for extra_params in escalera:
         params = dict(comun)
         params.update(extra_params)
-        for track in _pedir_a_jamendo(params):
+        try:
+            tracks = _pedir_a_jamendo(params)
+        except Exception:
+            tracks = []
+        for track in tracks:
             ficha = _ficha_musica(track)
             # lo unico innegociable: que se pueda bajar. Sin esto no hay tema.
             if not ficha["descarga"] or ficha["id"] in vistos:
+                continue
+            # y que se pueda usar en un canal monetizado (ver licencia_comercial)
+            if not licencia_comercial(ficha["licencia"]):
                 continue
             vistos.add(ficha["id"])
             salida.append(ficha)
@@ -670,9 +711,51 @@ def montar_banda(escenas, duracion_s, avisar=None, tramos=None):
                                    duracion_s=(tramo["hasta"] - tramo["desde"]),
                                    velocidad=tramo["velocidad"])
         elegido = elegir_tema(candidatos, evitar=usados)
+        if elegido is None and candidatos:
+            # Fallback 1: permitir reutilizar el mejor candidato aunque haya salido en otro tramo
+            elegido = elegir_tema(candidatos)
+
+        if elegido is None:
+            # Fallback 2: buscar temas instrumentales neutros más abiertos ("ambient", "soundtrack")
+            try:
+                candidatos_neutros = buscar_musica(
+                    animo="ambient", cuantas=12,
+                    duracion_s=(tramo["hasta"] - tramo["desde"]),
+                    velocidad="")
+                elegido = elegir_tema(candidatos_neutros, evitar=usados) or elegir_tema(candidatos_neutros)
+            except Exception:
+                pass
+
+        if elegido is None:
+            # Fallback 3: mirar en los ficheros locales ya existentes en el banco de música
+            dir_musica = banco("musica")
+            if os.path.exists(dir_musica):
+                locales = [f for f in os.listdir(dir_musica) if f.lower().endswith(".mp3")]
+                candidatos_locales = []
+                for arch in locales:
+                    base_nom = arch[:-4]
+                    partes = base_nom.split("_", 1)
+                    fuente = partes[0] if len(partes) > 1 else "jamendo"
+                    tid = partes[1] if len(partes) > 1 else partes[0]
+                    candidatos_locales.append({
+                        "fuente": fuente,
+                        "id": tid,
+                        "titulo": f"Tema banco {tid}",
+                        "artista": "Banco local",
+                        "licencia": "http://creativecommons.org/licenses/by/3.0/",
+                        "duracion": 180.0,
+                        "descarga": "",
+                    })
+                if candidatos_locales:
+                    elegido = elegir_tema(candidatos_locales, evitar=usados) or elegir_tema(candidatos_locales)
+
+        if elegido is None and puestos:
+            # Fallback 4: reutilizar el tema del tramo anterior
+            elegido = dict(puestos[-1])
+
         if elegido is None:
             raise RuntimeError(f"tramo {tramo['i'] + 1}: Jamendo no ha devuelto "
-                               f"ningun tema «{tramo['animo']}» que se pueda bajar")
+                               f"ningun tema «{tramo['animo']}» que se pueda bajar y no hay temas en el banco")
         usados.append(str(elegido["id"]))
         puestos.append({**{k: elegido.get(k) for k in
                            ("fuente", "id", "titulo", "artista", "licencia",
@@ -771,11 +854,13 @@ def buscar_efectos(consulta, dur_min=0.2, dur_max=8.0, cuantos=15):
                 "fields": ("id,name,tags,duration,license,username,url,previews,"
                            "ac_analysis"),
                 "sort": "downloads_desc",
-                "page_size": max(1, min(50, int(cuantos)))})
+                # de sobra: lo NC y Sampling+ se descarta aqui abajo
+                "page_size": max(1, min(150, int(cuantos) * 3))})
     if respuesta.status_code != 200:
         raise RuntimeError(f"Freesound {respuesta.status_code}: "
                            f"{respuesta.text[:200]}")
-    return [_ficha_efecto(s) for s in respuesta.json().get("results") or []]
+    fichas = [_ficha_efecto(s) for s in respuesta.json().get("results") or []]
+    return [f for f in fichas if licencia_comercial(f["licencia"])][:max(1, int(cuantos))]
 
 
 def _ficha_efecto(crudo):
@@ -1237,9 +1322,24 @@ def eventos(escenas, cortes, params, semilla=0):
                               "papel": papel, "ficha": ficha,
                               "ganancia": PAPELES[papel]["ganancia"]})
 
-        # 2. la maquina de escribir de una cartela, letra a letra
+        # 2. El efecto sonoro de tecleo de una cartela, según el estilo configurado
         if not cartelas.es_cartela(escena):
             continue
+
+        # Estilo de tecleo configurable:
+        # 'silencio': sin sonido de teclas ni campana (solo música y transiciones)
+        # 'digital': clics sutiles digitales sin campanita
+        # 'maquina' (defecto): máquina de escribir mecánica con campanita
+        estilo_tecla = str((params or {}).get("estilo_tecla") or (params or {}).get("tecleo") or "maquina").strip().lower()
+        if (params or {}).get("sonido_teclado") is False or estilo_tecla in ("silencio", "ninguno", "mudo", "desactivado", "false"):
+            continue
+
+        es_digital = estilo_tecla == "digital"
+        papel_tecla = "tecla_digital" if (es_digital and surtido.get("tecla_digital")) else "tecla"
+        ganancia_base = PAPELES.get(papel_tecla, {}).get("ganancia", 0.25)
+        if es_digital and papel_tecla == "tecla":
+            ganancia_base *= 0.50  # atenuar suavemente si se reutilizan teclas mecánicas
+
         # El plano de CONTINUACION de una cartela que dura dos no se escribe:
         # sigue puesta y quieta. Un teclado sonando ahi seria justo el fallo que
         # §26.4 evito -- oir escribir cuando no se escribe.
@@ -1262,24 +1362,25 @@ def eventos(escenas, cortes, params, semilla=0):
             siguiente = palabras[orden + 1][0] if orden + 1 < len(palabras) else \
                 cuando + 0.28
             hueco = max(0.04, min(siguiente - cuando, 0.5))
-            cuantas = max(1, min(TECLAS_POR_PALABRA, len(palabra.strip()),
+            cuantas = max(1, min(TECLAS_POR_PALABRA if not es_digital else 2, len(palabra.strip()),
                                  int(hueco * TECLAS_POR_SEGUNDO)))
             for golpe in range(cuantas):
-                ficha = elegir(surtido.get("tecla"), semilla, sid, orden, golpe,
+                ficha = elegir(surtido.get(papel_tecla) or surtido.get("tecla"), semilla, sid, orden, golpe,
                                vetados_de=prohibidos)
                 if not ficha:
                     break
                 fuera.append({
                     "t": inicio + cuando + hueco * golpe / max(1, cuantas),
-                    "papel": "tecla", "ficha": ficha,
+                    "papel": papel_tecla, "ficha": ficha,
                     # las pulsaciones no suenan todas igual de fuerte: un
                     # teclado con todas las teclas al mismo volumen suena a
                     # bucle, no a alguien escribiendo
-                    "ganancia": PAPELES["tecla"]["ganancia"] * (
+                    "ganancia": ganancia_base * (
                         0.78 + 0.22 * ((medios.desempatar(semilla, sid, orden,
                                                           golpe, "vol") % 100) / 99.0)),
                 })
-        if palabras:
+        # La campanita de carro solo suena en estilo máquina tradicional, nunca en digital o silencio
+        if palabras and not es_digital:
             ficha = elegir(surtido.get("retorno"), semilla, sid, "retorno",
                            vetados_de=prohibidos)
             if ficha:

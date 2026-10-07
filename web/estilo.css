@@ -851,8 +851,99 @@ video { width: 100%; border-radius: 9px; border: 1px solid var(--linea); backgro
   font-weight: 600; padding: 10px 16px; border-radius: 9px; opacity: 0;
   transition: opacity .25s; pointer-events: none; z-index: 70; max-width: 460px;
 }
-#toast.ver { opacity: 1; }
+#toast.ver { opacity: 1; pointer-events: auto; cursor: pointer; }
 #toast.malo { background: var(--aviso); color: var(--blanco); }
+
+/* ---------------------------------------------------------------- notificaciones */
+#btn-notificaciones { position: relative; }
+.badge-notif {
+  background: var(--aviso); color: #fff; font-size: 10px; font-weight: 700;
+  border-radius: 9px; padding: 1px 5px; margin-left: 4px; vertical-align: middle;
+}
+.badge-notif.oculto { display: none; }
+#notificaciones {
+  position: fixed; z-index: 60; top: 0; right: 0; bottom: 0;
+  width: min(520px, 96vw); display: flex; flex-direction: column;
+  background: var(--panel); border-left: 1px solid var(--linea);
+  box-shadow: var(--sombra); padding-top: env(safe-area-inset-top);
+}
+#notificaciones.plegado { display: none; }
+#cuerpo-notificaciones { overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
+.item-notif {
+  background: var(--hueco); border: 1px solid var(--linea);
+  border-radius: 8px; padding: 10px 12px; font-size: 13px; line-height: 1.4;
+}
+.item-notif.malo {
+  border-color: var(--aviso); background: rgba(220, 53, 69, 0.08);
+}
+.item-notif .cab-notif {
+  display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; font-size: 11px;
+}
+.item-notif .tag-notif {
+  font-weight: 700; text-transform: uppercase; font-size: 10px; padding: 1px 4px; border-radius: 4px;
+}
+.item-notif.malo .tag-notif { background: var(--aviso); color: #fff; }
+.item-notif:not(.malo) .tag-notif { background: var(--ok); color: var(--sobre-acento); }
+.item-notif .fecha-notif { color: var(--tenue); }
+.item-notif .texto-notif { color: var(--texto); word-break: break-word; white-space: pre-wrap; }
+
+/* ---------------------------------------------------------------- rejilla de escenas */
+.rejilla-escenas-previa {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+.tarjeta-miniatura-escena {
+  position: relative;
+  cursor: pointer;
+  background: var(--hueco);
+  border: 1px solid var(--linea);
+  border-radius: 6px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  transition: transform .15s ease, border-color .15s ease;
+  user-select: none;
+}
+.tarjeta-miniatura-escena:hover {
+  transform: translateY(-2px);
+  border-color: var(--acento);
+}
+.tarjeta-miniatura-escena.activa {
+  border-color: var(--acento);
+  box-shadow: 0 0 0 2px var(--acento);
+}
+.tarjeta-miniatura-escena img,
+.tarjeta-miniatura-escena video {
+  width: 100%;
+  aspect-ratio: 16/9;
+  object-fit: cover;
+  background: #111;
+  display: block;
+}
+.tarjeta-miniatura-escena .pie-mini {
+  padding: 5px 6px;
+  font-size: 11px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: var(--panel);
+}
+.tarjeta-miniatura-escena .pie-mini .id-mini {
+  font-weight: 700;
+  color: var(--texto);
+}
+.tarjeta-miniatura-escena .pie-mini .dur-mini {
+  color: var(--tenue);
+  font-size: 10px;
+}
+.selector-escenas-previa {
+  max-width: 220px;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  padding: 4px 8px;
+}
 
 /* ---------------------------------------------------------------- varios */
 
@@ -1277,6 +1368,22 @@ video { width: 100%; border-radius: 9px; border: 1px solid var(--linea); backgro
 .fila-calidad .precio { font-size: 15px; font-weight: 600; }
 .fila-calidad .veces { grid-column: 3; grid-row: 1; align-self: center; }
 .fila-calidad .desglose { grid-column: 2 / span 2; }
+/* Una opción de «quién lo hace» (imágenes: OpenAI o Flow; voz: Cartesia o
+   ElevenLabs). Mismo patrón que la calidad: un botón por opción, la puesta
+   deshabilitada y marcada con el acento. */
+.fila-opcion {
+  display: grid; width: 100%; text-align: left; margin-top: 6px; gap: 2px;
+  background: var(--hueco); border: 1px solid var(--linea);
+  border-radius: 8px; padding: 8px 10px; cursor: pointer;
+}
+.fila-opcion:hover:not(:disabled) { border-color: var(--acento); }
+.fila-opcion.elegida {
+  background: var(--marcado); border-color: var(--acento); cursor: default;
+  opacity: 1;
+}
+.fila-opcion .nombre { font-weight: 600; }
+.fila-opcion.elegida .nombre { color: var(--acento); }
+.fila-clave select { flex: 0 0 auto; }
 .fila-clave.columna { flex-direction: column; align-items: stretch; }
 .fila-clave.columna input { width: 100%; }
 .fila-clave .cola {
@@ -1362,6 +1469,27 @@ body.modo-light #coste { display: none; }
   color: var(--texto); text-decoration: none; font-size: 13px;
 }
 .pie-editor a.boton:hover { border-color: var(--acento); }
+
+/* LA TARJETA DE GOOGLE FLOW, encima de las imágenes: por dónde se sigue
+   cuando la tanda se ha parado esperando las imágenes hechas a mano. */
+.flow-tarjeta {
+  background: var(--hueco); border: 1px solid var(--acento);
+  border-radius: 10px; padding: 12px; margin-bottom: 12px;
+  display: grid; gap: 8px;
+}
+.flow-tarjeta h3 { margin: 0; font-size: 15px; }
+.flow-pasos { margin: 0; padding-left: 20px; display: grid; gap: 6px; line-height: 1.5; }
+.flow-tarjeta a.boton {
+  display: inline-flex; align-items: center; padding: 3px 8px;
+  border: 1px solid var(--linea); border-radius: 6px; background: var(--boton);
+  color: var(--texto); text-decoration: none; font-size: 12px;
+}
+.flow-tarjeta a.boton:hover { border-color: var(--acento); }
+.flow-ruta { font-family: var(--mono, monospace); word-break: break-all; }
+.flow-linea {
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  margin-bottom: 10px;
+}
 .previa-editor .light-previa { gap: 10px; }
 @media (max-width: 720px) {
   .mandos-previa .meta { flex: 1 0 100%; order: 3; }
@@ -2433,3 +2561,42 @@ button.avisa:hover:not(:disabled) { border-color: var(--aviso); }
 }
 .previa-feedback .aportadas { margin: 6px 0 8px; }
 .previa-feedback .zona-suelta { padding: 9px 11px; font-size: 12px; }
+
+/* El bloque de Google Vertex dentro de «Imágenes — quién las hace». */
+.vertex-bloque {
+  margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--linea);
+  display: grid; gap: 6px;
+}
+.vertex-bloque input[type=file] { flex: 1; min-width: 0; }
+
+/* LA MIRILLA DEL RENDER: lo ultimo que ha dibujado cada navegador, 2x2. */
+.mirilla {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px;
+  width: 100%; height: 100%; padding: 6px; box-sizing: border-box;
+}
+.mirilla figure { margin: 0; position: relative; min-height: 0; }
+.mirilla img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.mirilla img.oculto { visibility: hidden; }
+.mirilla figcaption {
+  position: absolute; left: 6px; bottom: 6px; padding: 2px 6px;
+  background: rgba(0, 0, 0, .65); color: #fff; border-radius: 4px;
+  font-size: 12px; font-family: var(--mono, monospace);
+}
+
+/* PARA PUBLICAR: titulos, descripcion y creditos, cada uno con su Copiar. */
+.publicar-bloque { display: grid; gap: 4px; margin-top: 8px; }
+.publicar-texto {
+  margin: 0; white-space: pre-wrap; word-break: break-word;
+  background: var(--hueco); border: 1px solid var(--linea); border-radius: 8px;
+  padding: 8px 10px; font: inherit; font-size: 13px; max-height: 260px; overflow: auto;
+}
+.publicar-titulo { gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--linea); }
+
+/* TEXTO EN PANTALLA: una fila por mando, la opcion puesta resaltada. */
+.texto-en-pantalla { display: grid; gap: 8px; }
+.texto-fila { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.texto-etiqueta { min-width: 120px; color: var(--tenue); font-size: 13px; }
+.texto-opciones { display: flex; gap: 6px; flex-wrap: wrap; }
+@media (max-width: 620px) {
+  .texto-etiqueta { min-width: 100%; }
+}

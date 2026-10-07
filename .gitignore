@@ -33,3 +33,9 @@ despliegue/login/node_modules/
 despliegue/login/datos/
 node_modules/
 .claude/
+
+# Instrucciones y reglas locales de asistentes IA
+GEMINI.md
+CLAUDE.local.md
+CLAUDE.md
+

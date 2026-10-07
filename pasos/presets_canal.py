@@ -150,7 +150,10 @@ TIPOS = {
         # clave llevaba desde entonces guardandose y aplicandose sin que nadie la
         # leyera. Y entra `subtitulo_tam`, que SI es una decision de grafismo y
         # se quedaba fuera: guardar un preset y aplicarlo perdia el tamano.
-        "claves": ("diseno", "paleta", "subtitulo_tam"),
+        # y la caja y la animacion del subtitulo (27-09-2026), que se eligen
+        # en «Texto en pantalla» y sin estar aqui se perdian al guardar
+        "claves": ("diseno", "paleta", "subtitulo_tam", "subtitulo_caja",
+                   "subtitulo_animacion"),
         "pasos": ("callouts",),
     },
     "voz": {

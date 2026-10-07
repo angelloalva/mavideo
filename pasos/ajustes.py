@@ -48,6 +48,13 @@ RUTA = os.environ.get("ESTUDIO_AJUSTES") or os.path.join(RAIZ_ESTUDIO,
 #: Las calidades que acepta el motor de imagen, de mas barata a mas cara.
 CALIDADES = ("low", "medium", "high")
 
+#: De donde salen las imagenes de los videos NUEVOS. 'openai' las genera y las
+#: paga; 'vertex' las genera con Nano Banana en Google Vertex (motores/
+#: imagen_vertex); 'flow' las adopta de lo que se hace a mano en Google Flow
+#: (ver pasos/flow.py). Igual que la calidad, se escribe en los params del proyecto
+#: AL CREARLO y no se lee al generar: cambiarlo no toca ningun video ya hecho.
+MOTORES_IMAGEN = ("openai", "vertex", "flow")
+
 #: El tamano con el que se generan los planos, y por tanto con el que hay que
 #: mirar la tabla de precios. Es el de `p6_assets` para 16:9.
 TAMANO = "1536x1024"
@@ -62,6 +69,10 @@ TOKENS_ENTRADA_POR_IMAGEN = 5114
 
 POR_DEFECTO = {
     "calidad_imagen": "low",
+    "imagenes": "openai",
+    # Donde deja la extension de Chrome lo descargado de Flow. Vacio es
+    # `Descargas/estudio_flow` (pasos/flow.py:descargas_por_defecto).
+    "flow_descargas": "",
     # Si ya se ha pasado por la guia de inicio (las tarjetas que piden las
     # claves al entrar por primera vez). Vive aqui y no en el navegador
     # porque es de la instalacion, no de la pantalla: desde el movil no hay
@@ -79,6 +90,9 @@ def leer():
             salida[clave] = valor
     if salida.get("calidad_imagen") not in CALIDADES:
         salida["calidad_imagen"] = POR_DEFECTO["calidad_imagen"]
+    if salida.get("imagenes") not in MOTORES_IMAGEN:
+        salida["imagenes"] = POR_DEFECTO["imagenes"]
+    salida["flow_descargas"] = str(salida.get("flow_descargas") or "").strip()
     salida["onboarding_visto"] = bool(salida.get("onboarding_visto"))
     return salida
 
@@ -98,11 +112,31 @@ def guardar(cambios):
         if clave == "calidad_imagen" and valor not in CALIDADES:
             raise ValueError(
                 f"calidad {valor!r}: solo {', '.join(CALIDADES)}")
+        if clave == "imagenes" and valor not in MOTORES_IMAGEN:
+            raise ValueError(
+                f"imagenes {valor!r}: solo {', '.join(MOTORES_IMAGEN)}")
+        if clave == "flow_descargas":
+            if not isinstance(valor, str):
+                raise ValueError("flow_descargas es una ruta")
+            valor = valor.strip()
+            if valor and not os.path.isabs(valor):
+                raise ValueError("la carpeta de descargas de Flow tiene que "
+                                 "ser una ruta completa")
         if clave == "onboarding_visto" and not isinstance(valor, bool):
             raise ValueError("onboarding_visto es verdadero o falso")
         actual[clave] = valor
     escribir_json(RUTA, actual)
     return actual
+
+
+def imagenes_con_flow():
+    """Si los videos nuevos se hacen con imagenes de Google Flow."""
+    return leer()["imagenes"] == "flow"
+
+
+def flow_descargas():
+    """La carpeta base de las descargas de Flow ('' = la de por defecto)."""
+    return leer()["flow_descargas"]
 
 
 def calidad_imagen():

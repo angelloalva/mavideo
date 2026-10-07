@@ -22,6 +22,11 @@ from . import asistente  # noqa: E402,F401
 from . import salud_cli  # noqa: E402,F401
 # comprobar_claves (cada clave contra su servicio) y mcp_estudio (las
 # herramientas del asistente) van detras: solo dependen de lo de arriba.
+# voz_proveedor (Cartesia o ElevenLabs) solo depende de claves; lo usan
+# comprobar_claves y la pantalla de configuracion.
+from . import voz_proveedor  # noqa: E402,F401
+# vertex_cfg (la cuenta de Google Vertex para las imagenes) solo depende de claves
+from . import vertex_cfg  # noqa: E402,F401
 from . import comprobar_claves, mcp_estudio  # noqa: E402,F401
 # tipografia va antes que nadie: la usan cartelas y p7, y no depende de nada
 from . import tipografia  # noqa: E402,F401
@@ -58,6 +63,11 @@ from . import medios, moodboard  # noqa: E402,F401
 # Wikimedia Commons; antes se llamaba commons.py, a un typo de comun.py) los
 from . import encuadres  # noqa: E402,F401
 from . import p6_assets, p7_callouts, p8_render  # noqa: E402,F401
+# flow (las imagenes hechas a mano en Google Flow y adoptadas por assets)
+# planifica con p6_assets, asi que va detras de el
+from . import flow  # noqa: E402,F401
+# publicar (titulo, descripcion y creditos para subir el video) solo usa el CLI
+from . import publicar  # noqa: E402,F401
 # y repaso (lo que se escribe MIRANDO el video montado) el ultimo de los que
 # deciden: reparte notas en cambios de todos los pasos anteriores
 from . import repaso  # noqa: E402,F401

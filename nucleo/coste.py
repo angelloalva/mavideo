@@ -611,6 +611,11 @@ def reportar_tts(caracteres, operacion="sintesis", unidad=None, tokens=None,
     """Anota una sintesis con los caracteres que el motor de voz envio de verdad."""
     caracteres = int(caracteres or 0)
     precio = tarifa_caracter()
+    # LA TARIFA ES LA DE CARTESIA. Una toma de ElevenLabs sale de los creditos
+    # de su plan, no de una factura por caracter: se anotan los caracteres
+    # --que es lo que gasta-- y cero dolares, en vez de inventar un importe.
+    if (detalle or {}).get("proveedor") == "elevenlabs":
+        precio = 0.0
     return _anotar("tts", operacion, unidad=unidad,
                    tokens=tokens, cantidad={"caracteres": caracteres},
                    usd=None if precio is None else precio * caracteres,
@@ -702,7 +707,8 @@ def _medir_toma_real(original):
         reportar_tts(len(texto or ""), operacion="toma",
                      detalle={"modelo": cfg.get("modelo"),
                               "voz_id": cfg.get("voz_id"),
-                              "idioma": cfg.get("idioma")})
+                              "idioma": cfg.get("idioma"),
+                              "proveedor": cfg.get("proveedor") or "cartesia"})
         return resultado
     return medido
 
@@ -729,6 +735,7 @@ def _medir_toma_por_contexto(original):
                      detalle={"modelo": cfg.get("modelo"),
                               "voz_id": cfg.get("voz_id"),
                               "idioma": cfg.get("idioma"),
+                              "proveedor": cfg.get("proveedor") or "cartesia",
                               "secciones": len(piezas)})
         return resultado
     return medido
@@ -772,6 +779,30 @@ def _medir_imagen(original):
         if isinstance(registro, dict) and registro.get("usd") is not None:
             meta["coste"] = float(registro["usd"])
             meta["coste_estimado"] = bool(registro.get("usd_estimado"))
+        return png, meta
+    return medido
+
+
+def _medir_imagen_vertex(original):
+    """El gasto de una imagen de Google Vertex (Nano Banana).
+
+    Va en la misma columna que las de OpenAI --«imagenes» en la cabecera--
+    con `proveedor: vertex` en el detalle. El importe lo calcula el propio motor
+    de su usageMetadata (tokens de entrada y de salida por la tarifa de Vertex),
+    que es lo mas cerca de la factura que se puede estar sin leerla.
+    """
+    def medido(prompt, referencias, *args, **kwargs):
+        png, meta = original(prompt, referencias, *args, **kwargs)
+        meta = meta if isinstance(meta, dict) else {}
+        uso = meta.get("usage") or {}
+        _anotar("openai", "imagen",
+                tokens={"entrada": uso.get("promptTokenCount"),
+                        "salida": uso.get("candidatesTokenCount")},
+                cantidad={"imagenes": 1},
+                usd=meta.get("coste"), usd_estimado=True,
+                detalle={"proveedor": "vertex", "modelo": meta.get("modelo"),
+                         "refs": meta.get("refs"), "segundos": meta.get("segundos"),
+                         "tamano": meta.get("tamano")})
         return png, meta
     return medido
 
@@ -854,6 +885,9 @@ def instrumentar(pasos=None):
 
     for modulo in modulos_de_imagen(pasos):
         _envolver(modulo, "generar", _medir_imagen, informe, "imagen_openai.generar")
+    for modulo in modulos_de_imagen(pasos, "imagen_vertex/vertex.py"):
+        _envolver(modulo, "generar", _medir_imagen_vertex, informe,
+                  "imagen_vertex.generar")
 
     # Y se queda apuntado para volver a engancharse si medios RECARGA un motor.
     # Sin esto, recargar imagen.py deja un objeto modulo nuevo cuya `generar` no
@@ -881,13 +915,18 @@ def _apuntarse_a_las_recargas(pasos, informe):
 
 def _reenganchar(clave, modulo):
     """Vuelve a medir un motor que se acaba de (re)cargar."""
-    if os.path.basename(str(clave)).lower() != "imagen.py":
+    nombre = os.path.basename(str(clave)).lower()
+    if nombre == "vertex.py":
+        _envolver(modulo, "generar", _medir_imagen_vertex,
+                  {"enganchado": [], "ausente": []}, "imagen_vertex.generar")
+        return
+    if nombre != "imagen.py":
         return
     _envolver(modulo, "generar", _medir_imagen,
               {"enganchado": [], "ausente": []}, "imagen_openai.generar")
 
 
-def modulos_de_imagen(pasos=None):
+def modulos_de_imagen(pasos=None, ruta="imagen_openai/imagen.py"):
     """Todas las copias cargadas del motor de imagen.
 
     Hay mas de una a proposito, aunque no lo parezca: los pasos 6, 7 y 8 hacen
@@ -905,15 +944,16 @@ def modulos_de_imagen(pasos=None):
         if medios is None or not hasattr(medios, "motor"):
             continue
         try:
-            modulo = medios.motor("imagen_openai/imagen.py")
+            modulo = medios.motor(ruta)
         except Exception:  # noqa: BLE001
             continue
         if modulo not in modulos:
             modulos.append(modulo)
     for modulo in list(sys.modules.values()):
         fichero = getattr(modulo, "__file__", "") or ""
-        if os.path.basename(fichero).lower() == "imagen.py" and \
-                "imagen_openai" in fichero.replace("/", os.sep) and \
+        carpeta, nombre = ruta.split("/")
+        if os.path.basename(fichero).lower() == nombre and \
+                carpeta in fichero.replace("/", os.sep) and \
                 modulo not in modulos:
             modulos.append(modulo)
     return modulos

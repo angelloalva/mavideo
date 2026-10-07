@@ -125,6 +125,25 @@ _candado_marcha = _COMPARTIDO.candado
 AL_CARGAR = _COMPARTIDO.al_cargar
 
 
+def motor_de_imagen(nombre=None):
+    """El motor que DIBUJA: Vertex (Nano Banana) o OpenAI. -> modulo
+
+    `nombre` es el `motor_imagen` del paso de assets ('openai' | 'vertex'); sin
+    el, el ajuste de los videos nuevos (`ajustes.imagenes`), que es lo que usan
+    las laminas de un estilo porque un estilo no es de ningun video. 'adoptar'
+    no dibuja: si llega aqui se devuelve OpenAI, que es lo de siempre.
+    """
+    if nombre is None:
+        try:
+            import ajustes                                   # noqa: PLC0415
+            nombre = ajustes.leer().get("imagenes")
+        except Exception:                                    # noqa: BLE001
+            nombre = "openai"
+    if nombre == "vertex":
+        return motor("imagen_vertex/vertex.py")
+    return motor("imagen_openai/imagen.py")
+
+
 def motor(ruta_relativa):
     """Importa un modulo de C:\\IA\\motores por ruta ('guion/segmentar.py').
 

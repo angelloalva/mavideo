@@ -50,7 +50,7 @@ RAIZ_ESTUDIO = os.path.dirname(os.path.abspath(__file__))
 if RAIZ_ESTUDIO not in sys.path:
     sys.path.insert(0, RAIZ_ESTUDIO)
 
-from fastapi import Body, FastAPI, Query, Request  # noqa: E402
+from fastapi import Body, FastAPI, File, Query, Request, UploadFile  # noqa: E402
 from fastapi.exceptions import RequestValidationError  # noqa: E402
 from fastapi.responses import (FileResponse, HTMLResponse,  # noqa: E402
                                JSONResponse, PlainTextResponse, Response,
@@ -878,6 +878,8 @@ def crear_proyecto(cuerpo: dict = Body(default=None)):
     try:
         ctx.estado.actualizar_params("assets",
                                      {"calidad": AJUSTES.calidad_imagen()})
+        # y de donde salen las imagenes, por la misma razon y en el mismo sitio
+        _preparar_flow_al_crear(ctx)
     except Exception:  # noqa: BLE001
         # un ajuste ilegible no puede impedir crear un proyecto: se queda con
         # el valor por defecto del paso, que es el que habia antes de todo esto
@@ -2759,6 +2761,173 @@ def guardar_catalogo(pid: str, cuerpo: dict = Body(default=None)):
                             for h in descendientes_de("assets")}}
 
 
+# ------------------------------------------------------ la mirilla del render
+
+@app.get("/api/proyectos/{pid}/render/mirilla")
+def mirilla_render(pid: str):
+    """El ultimo fotograma de cada plano que se esta dibujando AHORA.
+
+    Mientras renderiza, cada navegador escribe sus fotogramas en
+    `pasos/render/trabajo/frames/<plano>/fNNNNN.png`. Esto no toca el render:
+    solo mira el disco y dice, por plano, cual es el ultimo PNG y cuantos van
+    de cuantos. Los totales salen de los ficheros de lote de ESTE render (su
+    `desde`), asi que lo que quedo de un render anterior no cuenta.
+    """
+    ctx = contexto(pid)
+    trabajo = ctx.proyecto.ruta_trabajo("render", crear=False)
+    if not trabajo or not os.path.isdir(os.path.join(trabajo, "frames")):
+        return {"planos": []}
+    totales, desde = {}, None
+    dir_lotes = os.path.join(trabajo, "lotes")
+    try:
+        nombres = sorted(n for n in os.listdir(dir_lotes)
+                         if n.startswith("lote") and n.endswith(".json"))
+    except OSError:
+        nombres = []
+    fichas = []
+    for nombre in nombres:
+        datos = PASOS_MODULOS.medios.leer_json(os.path.join(dir_lotes, nombre), {}) or {}
+        for tarea in datos.get("tareas") or []:
+            fichas.append(tarea)
+            if tarea.get("desde"):
+                desde = max(desde or 0, float(tarea["desde"]))
+    # solo los lotes del ultimo render (los de uno anterior traen otro `desde`)
+    for tarea in fichas:
+        if desde is None or abs(float(tarea.get("desde") or 0) - desde) < 5:
+            totales[tarea["id"]] = int(tarea.get("frames") or 0)
+    planos = []
+    for sid, total in totales.items():
+        carpeta = os.path.join(trabajo, "frames", sid)
+        try:
+            pngs = [e for e in os.scandir(carpeta) if e.name.endswith(".png")]
+        except OSError:
+            continue
+        frescos = [e for e in pngs if desde is None or e.stat().st_mtime >= desde]
+        if not frescos:
+            continue
+        ultimo = max(frescos, key=lambda e: e.name)
+        planos.append({"id": sid, "hechos": len(frescos), "total": total,
+                       "cuando": ultimo.stat().st_mtime,
+                       "ruta": os.path.relpath(ultimo.path, ctx.proyecto.raiz)})
+    planos.sort(key=lambda p: -p["cuando"])
+    return {"planos": planos[:6]}
+
+
+# ------------------------------------------------------------- para publicar
+
+def _publicar_de(ctx):
+    modulo = PASOS_MODULOS.publicar
+    fichas = modulo.creditos(ctx.estado.params("render") or {})
+    return {"creditos": fichas, "texto_creditos": modulo.texto_creditos(fichas),
+            "propuesta": modulo.leer(ctx.proyecto),
+            "fichero": os.path.join(ctx.proyecto.raiz, modulo.NOMBRE_TXT)}
+
+
+@app.get("/api/proyectos/{pid}/publicar")
+def leer_publicar(pid: str):
+    """Los creditos que pide la musica y los efectos, y la ficha si ya se hizo."""
+    return _publicar_de(contexto(pid))
+
+
+def _correr_publicar(avisar, ctx):
+    modulo = PASOS_MODULOS.publicar
+    idioma = (ctx.estado.params("voz") or {}).get("idioma") or "es"
+    nombre = ctx.proyecto.config.get("nombre") or ctx.id
+    propuesta = modulo.proponer(ctx.proyecto, nombre, idioma, avisar=avisar)
+    fichas = modulo.creditos(ctx.estado.params("render") or {})
+    ficha = modulo.guardar(ctx.proyecto, propuesta, fichas)
+    avisar(1.0, "ficha para publicar lista")
+    return {"resumen": f"{len(ficha.get('titulos') or [])} títulos y la descripción"}
+
+
+@app.post("/api/proyectos/{pid}/publicar", status_code=202)
+def generar_publicar(pid: str):
+    """Pide al CLI titulos, descripcion y etiquetas. Va por la suscripcion."""
+    ctx = contexto(pid)
+    trabajo_id = ctx.gestor.lanzar("publicar", _correr_publicar, ctx, paso="render")
+    _registrar_trabajo(trabajo_id, ctx.id)
+    return {"trabajo_id": trabajo_id, "trabajo": ctx.gestor.estado(trabajo_id)}
+
+
+# ---------------------------------------------------------------- Google Flow
+
+def _flow_de(ctx):
+    """Lo que la tarjeta de Flow necesita saber de este video."""
+    flow = _flow()
+    estado = flow.estado(ctx.proyecto.raiz, _descargas_flow(ctx))
+    ruta_estilo = os.path.join(flow.carpeta_flow(ctx.proyecto.raiz), "estilo.txt")
+    try:
+        with open(ruta_estilo, encoding="utf-8") as fh:
+            estilo = fh.read().strip()
+    except OSError:
+        estilo = ""
+    estado.update({
+        "activo": _es_flow(ctx),
+        "estilo": estilo,
+        "extension": os.path.join(RAIZ_ESTUDIO, "herramientas", "flow_extension"),
+    })
+    return estado
+
+
+@app.get("/api/proyectos/{pid}/flow")
+def leer_flow(pid: str):
+    """Cuantas imagenes de Flow hay, cuantas faltan y cuantas esperan en Descargas."""
+    return _flow_de(contexto(pid))
+
+
+@app.post("/api/proyectos/{pid}/flow/exportar")
+def exportar_flow(pid: str, cuerpo: dict = Body(default=None)):
+    """Vuelve a escribir los prompts; con `sugerir`, pide otra frase de estilo.
+
+    La tanda de las imagenes ya exporta sola al llegar a los planos: esto es
+    para cambiar la frase de estilo o para rehacer la exportacion a mano.
+    """
+    ctx = contexto(pid)
+    if not _es_flow(ctx):
+        raise ErrorApi(400, "este video no hace las imagenes con Flow")
+    datos = _cuerpo(cuerpo)
+    try:
+        hecho = _exportar_flow(ctx, sugerir=bool(datos.get("sugerir")))
+    except Exception as fallo:  # noqa: BLE001
+        raise ErrorApi(409, f"no se han podido preparar los prompts: {fallo}. "
+                            f"¿Está generada la voz del vídeo?")
+    salida = _flow_de(ctx)
+    salida["movidas"] = hecho.get("movidas") or []
+    return salida
+
+
+@app.get("/api/proyectos/{pid}/flow/tanda.json")
+def descargar_tanda_flow(pid: str):
+    """El fichero que carga la extension de Chrome en Flow."""
+    ctx = contexto(pid)
+    ruta = os.path.join(_flow().carpeta_flow(ctx.proyecto.raiz), "tanda.json")
+    if not os.path.isfile(ruta):
+        raise ErrorApi(404, "todavía no se han preparado los prompts de Flow")
+    return FileResponse(ruta, media_type="application/json",
+                        filename=f"tanda_{ctx.id}.json")
+
+
+@app.post("/api/proyectos/{pid}/flow/importar")
+def importar_flow(pid: str):
+    """Trae de la carpeta de descargas lo nuevo o rehecho. No lanza nada.
+
+    Seguir con los planos es volver a lanzar la tanda de las imagenes, y eso lo
+    hace la pantalla: es el mismo boton de siempre, con su coste delante.
+    """
+    ctx = contexto(pid)
+    if not _es_flow(ctx):
+        raise ErrorApi(400, "este video no hace las imagenes con Flow")
+    try:
+        hecho = _flow().importar(ctx.proyecto.raiz, _descargas_flow(ctx))
+    except RuntimeError as fallo:
+        raise ErrorApi(409, str(fallo))
+    ctx.bitacora.anotar("flow_importado", "assets",
+                        {"copiadas": hecho["copiadas"], "faltan": len(hecho["faltan"])})
+    salida = _flow_de(ctx)
+    salida["copiadas"] = hecho["copiadas"]
+    return salida
+
+
 @app.get("/api/proyectos/{pid}/assets/hechos")
 def planos_hechos(pid: str, ligero: int = Query(default=0)):
     """Los planos que hay generados AHORA en la carpeta de trabajo.
@@ -4207,22 +4376,36 @@ def _ruta_de_version(ctx, paso, *partes):
     `GET /a/{pid}/{ruta}`: relativa al proyecto y con barras normales.
     """
     version = ctx.proyecto.version_activa(paso)
-    if not version:
-        return None
-    ruta = os.path.join(ctx.proyecto.ruta_paso(paso, version), *partes)
-    if not os.path.exists(ruta):
-        return None
-    return "/".join(["pasos", paso, f"v{int(version)}"] + list(partes))
+    if version:
+        ruta = os.path.join(ctx.proyecto.ruta_paso(paso, version), *partes)
+        if os.path.exists(ruta):
+            return "/".join(["pasos", paso, f"v{int(version)}"] + list(partes))
+    # Respaldo: si aun no esta en la version activa o el paso quedo interrumpido, buscar en trabajo/
+    try:
+        ruta_tr = os.path.join(ctx.proyecto.ruta_trabajo(paso, crear=False), *partes)
+        if os.path.exists(ruta_tr):
+            return "/".join(["pasos", paso, "trabajo"] + list(partes))
+    except Exception:
+        pass
+    return None
 
 
 def _ficha_de_escena(ctx, sid):
     """La ficha del dibujo de un plano: para QUE texto se dibujo, y su ruta."""
     version = ctx.proyecto.version_activa("assets")
-    if not version:
-        return {}
-    ruta = os.path.join(ctx.proyecto.ruta_paso("assets", version),
-                        "escenas", f"{sid}.json")
-    return PASOS_MODULOS.medios.leer_json(ruta, {}) or {}
+    if version:
+        ruta = os.path.join(ctx.proyecto.ruta_paso("assets", version),
+                            "escenas", f"{sid}.json")
+        if os.path.exists(ruta):
+            return PASOS_MODULOS.medios.leer_json(ruta, {}) or {}
+    try:
+        ruta_tr = os.path.join(ctx.proyecto.ruta_trabajo("assets", crear=False),
+                               "escenas", f"{sid}.json")
+        if os.path.exists(ruta_tr):
+            return PASOS_MODULOS.medios.leer_json(ruta_tr, {}) or {}
+    except Exception:
+        pass
+    return {}
 
 
 def _obsolescencia(ctx, escena):
@@ -4339,6 +4522,51 @@ def aceptar_imagen_obsoleta(pid: str, sid: str):
     return {"ok": True, "id": sid}
 
 
+@app.put("/api/proyectos/{pid}/escenas/{sid}/prompt")
+def guardar_prompt_escena(pid: str, sid: str, cuerpo: dict = Body(default=None)):
+    """Guarda un prompt técnico personalizado para un plano concreto."""
+    ctx = contexto(pid)
+    datos = _cuerpo(cuerpo)
+    nuevo_prompt = str(datos.get("prompt") or "").strip()
+    if not nuevo_prompt:
+        raise ErrorApi(400, "el prompt no puede estar vacío")
+    sid = str(sid).strip().upper()
+    uid = f"escena:{sid}"
+
+    # 1. Guardar en params de assets (fusionando)
+    previos = (ctx.estado.params("assets") or {}).get("unidades") or {}
+    actual = previos.get(uid)
+    actual = dict(actual) if isinstance(actual, dict) else {}
+    actual["prompt"] = nuevo_prompt
+    bloque = {uid: actual}
+    ctx.estado.actualizar_params("assets", {"unidades": bloque})
+
+    # 2. Actualizar en plan.json de la versión activa de assets
+    version = ctx.proyecto.version_activa("assets")
+    if version:
+        ruta_plan_v = os.path.join(ctx.proyecto.ruta_paso("assets", version), "plan.json")
+        if os.path.exists(ruta_plan_v):
+            plan_v = PASOS_MODULOS.medios.leer_json(ruta_plan_v, {}) or {}
+            for e in (plan_v.get("escenas") or []):
+                if str(e.get("id") or "").upper() == sid:
+                    e["prompt"] = nuevo_prompt
+                    e["prompt_editado"] = True
+            PASOS_MODULOS.medios.escribir_json(ruta_plan_v, plan_v)
+
+    # 3. Actualizar en carpeta de trabajo si existe
+    ruta_trabajo = ctx.proyecto.ruta_trabajo("assets", crear=False)
+    ruta_plan_t = os.path.join(ruta_trabajo, "plan.json")
+    if os.path.exists(ruta_plan_t):
+        plan_t = PASOS_MODULOS.medios.leer_json(ruta_plan_t, {}) or {}
+        for e in (plan_t.get("escenas") or []):
+            if str(e.get("id") or "").upper() == sid:
+                e["prompt"] = nuevo_prompt
+                e["prompt_editado"] = True
+        PASOS_MODULOS.medios.escribir_json(ruta_plan_t, plan_t)
+
+    return {"ok": True, "id": sid, "prompt": nuevo_prompt}
+
+
 @app.get("/api/proyectos/{pid}/previsualizacion")
 def leer_previsualizacion(pid: str):
     """Las piezas para ver el video sin montarlo. -> {escenas, audio, ...}"""
@@ -4356,6 +4584,20 @@ def leer_previsualizacion(pid: str):
     # lo mismo, y uno de los dos viejo.
     params_callouts = ctx.estado.params("callouts") or {}
     medir, banda = _medidor_de_subtitulo(ctx, plan)
+
+    clips_por_sid = {}
+    if PASOS_MODULOS and hasattr(PASOS_MODULOS, "flow"):
+        ruta_vjson = os.path.join(ctx.proyecto.raiz, "flow", "videos.json")
+        if os.path.isfile(ruta_vjson):
+            try:
+                with open(ruta_vjson, "r", encoding="utf-8") as fh:
+                    vdata = json.load(fh)
+                for c in (vdata.get("clips") or []):
+                    if c.get("escena_id"):
+                        clips_por_sid[str(c["escena_id"]).upper()] = c
+            except Exception:
+                pass
+
     escenas = []
     for escena in escenas_plan:
         sid = str(escena.get("id") or "")
@@ -4383,15 +4625,32 @@ def leer_previsualizacion(pid: str):
                     params_callouts, f"escena:{sid}")) or []
         except Exception:                                     # noqa: BLE001
             trozos = []
+        info_clip = clips_por_sid.get(sid.upper())
+        flow_n = info_clip.get("num") if info_clip else (escena.get("flow_num") if not clips_por_sid else None)
+        vid_manual = None
+        if PASOS_MODULOS and hasattr(PASOS_MODULOS, "flow"):
+            vid_manual = PASOS_MODULOS.flow.buscar_video_de_escena(
+                ctx.proyecto.raiz, sid, flow_num=flow_n)
+        hay_video = bool(vid_manual and os.path.exists(vid_manual))
+        prompt_flow = info_clip.get("prompt") if info_clip else (escena.get("flow_prompt") or None)
+        es_flow = bool(info_clip) or hay_video or bool(prompt_flow) or (escena.get("tipo_visual") == "flow_video")
+        cuarta = info_clip.get("cuarta_pared", False) if info_clip else escena.get("cuarta_pared", False)
+
         escenas.append({
             "id": sid,
             "t_in": round(float(escena.get("t_in") or 0.0), 3),
             "t_out": round(float(escena.get("t_out") or 0.0), 3),
             "duracion": round(float(escena.get("duracion") or 0.0), 3),
             "narracion": escena.get("narracion") or "",
+            "prompt": escena.get("prompt") or "",
             "bloque": (escena.get("origen") or {}).get("bloque") or "",
             "cartela": (escena.get("cartela") or {}).get("plantilla") or "",
             "imagen": _ruta_de_version(ctx, "assets", "escenas", f"{sid}.png"),
+            "video": f"/api/proyectos/{ctx.id}/escenas/{sid}/video" if hay_video else None,
+            "es_video": hay_video or es_flow,
+            "flow_num": flow_n,
+            "flow_prompt": prompt_flow,
+            "cuarta_pared": cuarta,
             # y si el dibujo que hay ya no es de lo que aqui se dice. Va vacio
             # cuando esta al dia: es una excepcion, no un campo de todos.
             **_obsolescencia(ctx, escena),
@@ -4443,6 +4702,174 @@ def leer_previsualizacion(pid: str):
         "con_cartelas": bool(ctx.proyecto.version_activa("callouts")),
         "montado": bool(_ruta_de_version(ctx, "render", "video.mp4")),
     }
+
+
+@app.get("/api/proyectos/{pid}/escenas/{sid}/video")
+def servir_video_escena(pid: str, sid: str, peticion: Request):
+    """Devuelve el archivo .mp4 de video manual/Flow asignado a una escena."""
+    ctx = contexto(pid)
+    plan = PASOS_MODULOS.p6_assets.plan_actual(ctx.proyecto, "assets", estado=ctx.estado) or {} if PASOS_MODULOS else {}
+    escena = next((e for e in (plan.get("escenas") or []) if str(e.get("id") or "").upper() == sid.upper()), {})
+    vid = None
+    if PASOS_MODULOS and hasattr(PASOS_MODULOS, "flow"):
+        vid = PASOS_MODULOS.flow.buscar_video_de_escena(
+            ctx.proyecto.raiz, sid, flow_num=escena.get("flow_num"))
+    if not vid or not os.path.isfile(vid):
+        raise ErrorApi(404, f"No hay video disponible para la escena {sid}")
+    return servir_fichero(peticion, vid)
+
+
+@app.post("/api/proyectos/{pid}/escenas/{sid}/video")
+async def subir_video_escena(pid: str, sid: str, archivo: UploadFile = File(...)):
+    """Sube un clip de video manual (.mp4) para una escena concreta."""
+    import subprocess
+    ctx = contexto(pid)
+    if not PASOS_MODULOS or not hasattr(PASOS_MODULOS, "flow"):
+        raise ErrorApi(503, "Modulo de Flow no disponible")
+    dir_vid = PASOS_MODULOS.flow.carpeta_videos(ctx.proyecto.raiz)
+    os.makedirs(dir_vid, exist_ok=True)
+    destino_mp4 = os.path.join(dir_vid, f"{sid}.mp4")
+
+    contenido = await archivo.read()
+    if not contenido:
+        raise ErrorApi(400, "El archivo de video esta vacio")
+
+    with open(destino_mp4, "wb") as fh:
+        fh.write(contenido)
+
+    # Extraer primer fotograma para poster/previsualizacion
+    poster_png = os.path.join(ctx.proyecto.raiz, "pasos", "assets", "trabajo", "escenas", f"{sid}.png")
+    activa_assets = ctx.proyecto.ruta_paso("assets")
+    posters = [poster_png]
+    if activa_assets and os.path.isdir(activa_assets):
+        posters.append(os.path.join(activa_assets, "escenas", f"{sid}.png"))
+
+    bin_ffmpeg = PASOS_MODULOS.medios.ffmpeg() if (PASOS_MODULOS and hasattr(PASOS_MODULOS, "medios")) else "ffmpeg"
+    flow_img = os.path.join(ctx.proyecto.raiz, "flow", "imagenes", f"{sid}.png")
+    posters.append(flow_img)
+
+    for p_png in posters:
+        os.makedirs(os.path.dirname(p_png), exist_ok=True)
+        try:
+            cmd = [bin_ffmpeg, "-y", "-ss", "0", "-i", destino_mp4, "-vframes", "1", p_png]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "sid": sid,
+        "archivo": f"{sid}.mp4",
+        "video": f"/api/proyectos/{ctx.id}/escenas/{sid}/video",
+        "tamano": len(contenido),
+    }
+
+
+@app.post("/api/proyectos/{pid}/escenas/{sid}/flow-prompt")
+def generar_flow_prompt_escena(pid: str, sid: str, cuerpo: dict = Body(default=None)):
+    """Genera o actualiza el prompt cinematográfico para Google Flow Video de esta escena."""
+    ctx = contexto(pid)
+    sid = str(sid).strip().upper()
+    if not PASOS_MODULOS or not hasattr(PASOS_MODULOS, "flow"):
+        raise ErrorApi(503, "Módulo de Flow no disponible")
+
+    plan = PASOS_MODULOS.p6_assets.plan_actual(ctx.proyecto, "assets", estado=ctx.estado) or {}
+    escenas = plan.get("escenas") or []
+    escena = next((e for e in escenas if str(e.get("id") or "").upper() == sid), None)
+    if not escena:
+        raise ErrorApi(404, f"No existe la escena {sid}")
+
+    datos = _cuerpo(cuerpo)
+    prompt_personalizado = str(datos.get("prompt") or "").strip()
+
+    if prompt_personalizado:
+        nuevo_prompt = prompt_personalizado
+    else:
+        nuevo_prompt = PASOS_MODULOS.flow.generar_prompt_video_escena(escena)
+
+    # 1. Guardar en params de assets (fusionando)
+    uid = f"escena:{sid}"
+    previos = (ctx.estado.params("assets") or {}).get("unidades") or {}
+    actual = previos.get(uid)
+    actual = dict(actual) if isinstance(actual, dict) else {}
+    actual["flow_prompt"] = nuevo_prompt
+    actual["tipo_visual"] = "flow_video"
+    actual["video_manual"] = True
+    actual["es_video"] = True
+    ctx.estado.actualizar_params("assets", {"unidades": {uid: actual}})
+
+    # 2. Actualizar en plan.json de la versión activa de assets si existe
+    version = ctx.proyecto.version_activa("assets")
+    if version:
+        ruta_plan_v = os.path.join(ctx.proyecto.ruta_paso("assets", version), "plan.json")
+        if os.path.exists(ruta_plan_v):
+            plan_v = PASOS_MODULOS.medios.leer_json(ruta_plan_v, {}) or {}
+            for e in (plan_v.get("escenas") or []):
+                if str(e.get("id") or "").upper() == sid:
+                    e["flow_prompt"] = nuevo_prompt
+                    e["tipo_visual"] = "flow_video"
+                    e["video_manual"] = True
+            PASOS_MODULOS.medios.escribir_json(ruta_plan_v, plan_v)
+
+    # 3. Actualizar en carpeta de trabajo si existe
+    ruta_trabajo = ctx.proyecto.ruta_trabajo("assets", crear=False)
+    ruta_plan_t = os.path.join(ruta_trabajo, "plan.json")
+    if os.path.exists(ruta_plan_t):
+        plan_t = PASOS_MODULOS.medios.leer_json(ruta_plan_t, {}) or {}
+        for e in (plan_t.get("escenas") or []):
+            if str(e.get("id") or "").upper() == sid:
+                e["flow_prompt"] = nuevo_prompt
+                e["tipo_visual"] = "flow_video"
+                e["video_manual"] = True
+        PASOS_MODULOS.medios.escribir_json(ruta_plan_t, plan_t)
+
+    # 4. Actualizar en flow/videos.json si existe
+    ruta_vjson = os.path.join(ctx.proyecto.raiz, "flow", "videos.json")
+    if os.path.isfile(ruta_vjson):
+        try:
+            vdata = PASOS_MODULOS.medios.leer_json(ruta_vjson, {}) or {}
+            clips = vdata.get("clips") or []
+            clip_existente = next((c for c in clips if str(c.get("escena_id") or "").upper() == sid), None)
+            if clip_existente:
+                clip_existente["prompt"] = nuevo_prompt
+            else:
+                max_num = max([int(c.get("num") or 0) for c in clips] or [0])
+                clips.append({
+                    "num": max_num + 1,
+                    "titulo": f"Clip escena {sid}",
+                    "prompt": nuevo_prompt,
+                    "escena_id": sid,
+                    "cuarta_pared": False,
+                    "duracion_voz": escena.get("duracion"),
+                    "archivo_recomendado": f"{sid}.mp4",
+                    "presente": bool(PASOS_MODULOS.flow.buscar_video_de_escena(ctx.proyecto.raiz, sid)),
+                    "ruta": None
+                })
+            vdata["clips"] = clips
+            vdata["total"] = len(clips)
+            PASOS_MODULOS.medios.escribir_json(ruta_vjson, vdata)
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "sid": sid,
+        "flow_prompt": nuevo_prompt,
+        "duracion": escena.get("duracion"),
+        "tipo_visual": "flow_video",
+    }
+
+
+@app.get("/api/proyectos/{pid}/flow/videos")
+def obtener_flow_videos(pid: str):
+    """Estado y lista de prompts de clips Flow del proyecto."""
+    ctx = contexto(pid)
+    plan = PASOS_MODULOS.p6_assets.plan_actual(ctx.proyecto, "assets", estado=ctx.estado) or {} if PASOS_MODULOS else {}
+    escenas = plan.get("escenas") or []
+    if not PASOS_MODULOS or not hasattr(PASOS_MODULOS, "flow"):
+        raise ErrorApi(503, "Modulo de Flow no disponible")
+    resumen = PASOS_MODULOS.flow.exportar_prompts_video(ctx.proyecto.raiz, escenas=escenas)
+    return resumen
 
 
 # ------------------------------------------- la nota del vídeo terminado
@@ -4597,6 +5024,24 @@ def editar_nota_repaso(pid: str, nid: str, cuerpo: dict = Body(default=None)):
     except ValueError as fallo:
         raise ErrorApi(400, str(fallo))
     return {"nota": nota, **_ficha_repaso(ctx)}
+
+
+@app.delete("/api/proyectos/{pid}/repaso/limpiar-aplicadas")
+def limpiar_notas_aplicadas(pid: str):
+    """Elimina del repaso todas las notas que ya estan en estado aplicado."""
+    ctx = contexto(pid)
+    cuaderno = _repaso().leer(ctx.proyecto)
+    notas = cuaderno.get("notas") or []
+    borradas = 0
+    nuevas = []
+    for n in notas:
+        if n.get("estado") == "aplicado":
+            borradas += 1
+        else:
+            nuevas.append(n)
+    cuaderno["notas"] = nuevas
+    _repaso().guardar(ctx.proyecto, cuaderno)
+    return {"borradas": borradas, **_ficha_repaso(ctx)}
 
 
 @app.delete("/api/proyectos/{pid}/repaso/{nid}")
@@ -5118,6 +5563,8 @@ def leer_sonido(pid: str):
         surtido[papel] = sorted(lista, key=lambda x: -(x.get("agudo") or 0))
     return {
         "activo": render.get("sonido", True),
+        "estilo_tecla": render.get("estilo_tecla", "maquina"),
+        "sonido_teclado": render.get("sonido_teclado", True),
         "musica": render.get("musica") or {},
         "efectos": surtido,
         # LOS VETADOS DEL CANAL. Viajan a la pantalla para poder pintar la ✕ ya
@@ -5175,6 +5622,10 @@ def guardar_sonido(pid: str, cuerpo: dict = Body(default=None)):
     cambios = {}
     if "activo" in datos:
         cambios["sonido"] = bool(datos["activo"])
+    if "estilo_tecla" in datos:
+        cambios["estilo_tecla"] = str(datos["estilo_tecla"] or "maquina")
+    if "sonido_teclado" in datos:
+        cambios["sonido_teclado"] = bool(datos["sonido_teclado"])
     if isinstance(datos.get("lufs"), (int, float)):
         cambios["musica_lufs"] = max(-40.0, min(-10.0, float(datos["lufs"])))
     if "musica" in datos:
@@ -5193,11 +5644,12 @@ def guardar_sonido(pid: str, cuerpo: dict = Body(default=None)):
                 raise ErrorApi(502, f"no se ha podido bajar el tema: {fallo}")
             cambios["musica"] = ficha
     if not cambios:
-        raise ErrorApi(400, "hace falta 'musica', 'activo' o 'lufs'")
+        raise ErrorApi(400, "hace falta 'musica', 'activo', 'estilo_tecla' o 'lufs'")
     ctx.estado.actualizar_params("render", cambios)
     ctx.bitacora.anotar("sonido", "render", {
         "musica": (cambios.get("musica") or {}).get("titulo"),
-        "activo": cambios.get("sonido")})
+        "activo": cambios.get("sonido"),
+        "estilo_tecla": cambios.get("estilo_tecla")})
     return {"guardado": list(cambios), "estado": ctx.estado.estado_de("render")}
 
 
@@ -5366,6 +5818,10 @@ def leer_ajustes():
     precio de la imagen devuelta es elegir mirando la parte pequena.
     """
     return {"ajustes": AJUSTES.leer(),
+            "motores_imagen": list(AJUSTES.MOTORES_IMAGEN),
+            # donde deja la extension de Flow las descargas si no se dice otra
+            "flow_descargas_por_defecto": os.path.join(
+                os.path.expanduser("~"), "Downloads", "estudio_flow"),
             "calidades": list(AJUSTES.CALIDADES),
             "costes": AJUSTES.tabla_de_costes(),
             "tamano": AJUSTES.TAMANO}
@@ -5435,6 +5891,123 @@ def _referencias_de_estilo_o_400(ctx):
     return rutas
 
 
+# --------------------------------------------------------------- Google Flow
+#
+# LAS IMAGENES HECHAS A MANO EN FLOW, adoptadas por el paso de assets
+# (`motor_imagen: "adoptar"`, ver pasos/flow.py). Un video en este modo recorre
+# la misma receta que cualquier otro; lo que cambia son las dos tareas que
+# pagarian imagenes --las piezas y los planos--, que pasan por una PUERTA:
+#
+#   1. exporta los prompts (tanda.json para la extension de Chrome),
+#   2. trae lo que haya en la carpeta de descargas,
+#   3. y si falta alguna imagen se para AHI, sin error: la tanda termina, la
+#      pantalla ensena la tarjeta de Flow y se sigue con «Importar de Flow y
+#      seguir», que vuelve a lanzar la tanda. Con todas, adopta a coste cero.
+#
+# Nunca replantea: replantear vuelve a cortar la narracion, y los ids S001...
+# de las imagenes ya hechas pasarian a narrar otra cosa.
+
+def _flow():
+    return PASOS_MODULOS.flow
+
+
+def _es_flow(ctx):
+    return _flow().es_flow(ctx.estado.params("assets") or {})
+
+
+def _descargas_flow(ctx):
+    return _flow().carpeta_descargas(ctx.id, AJUSTES.flow_descargas() or None)
+
+
+def _preparar_flow_al_crear(ctx):
+    """Un video nuevo nace con el motor de imagen del ajuste. -> el motor
+
+    Con «Google Flow» adopta lo que se haga a mano; con «Google Vertex» genera
+    con Nano Banana; con OpenAI no se escribe nada (es el de fabrica del paso).
+    Como la calidad: se escribe AL CREAR y no se lee al generar, asi que cambiar
+    el ajuste no toca ningun video que ya exista.
+    """
+    motor = AJUSTES.leer().get("imagenes")
+    if motor == "flow":
+        ctx.estado.actualizar_params("assets",
+                                     _flow().params_flow(ctx.proyecto.raiz))
+    elif motor == "vertex":
+        ctx.estado.actualizar_params("assets", {"motor_imagen": "vertex"})
+    return motor
+
+
+def _carpeta_version_assets(ctx):
+    version = ctx.proyecto.version_activa("assets")
+    return ctx.proyecto.ruta_paso("assets", version) if version else None
+
+
+def _exportar_flow(ctx, avisar=None, sugerir=False):
+    """Exporta los prompts y dice que imagenes ya hechas narran otra cosa.
+
+    Los ids son posicionales: si el corte cambio desde la ultima exportacion,
+    la imagen de S014 puede ser de una frase que ya no esta en S014.
+    """
+    flow = _flow()
+    antes = {p["id"]: p.get("narracion")
+             for p in flow.planos_exportados(ctx.proyecto.raiz)}
+    hecho = flow.exportar(ctx.proyecto, ctx.estado.params("assets") or {},
+                          sugerir=sugerir,
+                          avisar=(lambda m: avisar(None, m)) if avisar else None)
+    carpeta = flow.carpeta_imagenes(ctx.proyecto.raiz)
+    movidas = [p["id"] for p in hecho["planos"]
+               if p["id"] in antes and antes[p["id"]] != p.get("narracion")
+               and os.path.exists(os.path.join(carpeta, f"{p['id']}.png"))]
+    if movidas and avisar:
+        avisar(None, "AVISO: el corte ha cambiado y estas imagenes de Flow "
+                     "eran de otra frase: " + ", ".join(movidas[:12]))
+    hecho["movidas"] = movidas
+    return hecho
+
+
+def _correr_puerta_flow(avisar, ctx, modo, extra):
+    """Piezas o planos en modo Flow: adopta si estan todas, si no se para."""
+    flow = _flow()
+    avisar(0.05, "preparando los prompts de Flow")
+    _exportar_flow(ctx, avisar)
+    avisar(0.2, "trayendo lo descargado de Flow")
+    hecho = flow.importar(ctx.proyecto.raiz, _descargas_flow(ctx))
+    if hecho["faltan"]:
+        faltan = len(hecho["faltan"])
+        avisar(1.0, f"esperando {faltan} de {hecho['total']} imágenes de Flow")
+        return {"resumen": f"faltan {faltan} de {hecho['total']} imágenes de "
+                           f"Flow: hazlas y pulsa «Importar de Flow y seguir»",
+                "flow_pendiente": faltan}
+    opciones = dict(extra or {}, replantear=False, rehacer=False)
+    unidades = None
+    version = _carpeta_version_assets(ctx)
+    if version and modo != "todo":
+        # UNA IMAGEN REHECHA EN FLOW NO MUEVE LA FIRMA: sin pedirla por unidad
+        # el paso daria el plano por hecho y seguiria con la vieja
+        cambiadas = flow.cambiadas(ctx.proyecto.raiz, version)
+        if "tipos" in opciones:
+            cambiadas = [u for u in cambiadas if u.startswith("asset:")]
+        if cambiadas:
+            unidades = cambiadas
+        elif ctx.estado.al_dia("assets"):
+            avisar(1.0, "las imágenes de Flow ya estaban puestas")
+            return {"resumen": "las imágenes de Flow ya estaban puestas"}
+        else:
+            unidades = _plan_de_ejecucion(ctx, "assets", {})
+    return _correr_paso(avisar, ctx, "assets", unidades, opciones)
+
+
+def _flow_al_dia(ctx):
+    """En modo Flow, assets esta al dia si ademas no hay ninguna imagen nueva."""
+    if not ctx.estado.al_dia("assets"):
+        return False
+    return not _flow().cambiadas(ctx.proyecto.raiz, _carpeta_version_assets(ctx))
+
+
+def _sin_guia_con_flow(avisar, ctx):
+    avisar(1.0, "con Flow el estilo lo pone la frase de estilo")
+    return {"resumen": "con imágenes de Flow no hace falta la guía de estilo"}
+
+
 # Cada entrada: (funcion, argumentos) a partir de (ctx, receta). La funcion
 # recibe `avisar` como primer argumento, igual que cualquier trabajo del gestor.
 def _un_paso(ctx, paso_id, modo, extra=None):
@@ -5488,6 +6061,10 @@ def _que_hace(tarea_id, ctx, receta, modo="pendientes", solo_montar=False):
         return _correr_escenarios, (
             ctx, _ajuste_de_fase(receta, "catalogo_visual"), "", False)
     if tarea_id == "guia_estilo":
+        # con Flow no hay laminas que mirar ni prompts a los que adjuntarlas:
+        # el estilo lo pone la frase de estilo de pasos/flow.py
+        if _es_flow(ctx):
+            return _sin_guia_con_flow, (ctx,)
         return _correr_guia_estilo, (
             ctx, _referencias_de_estilo_o_400(ctx),
             _ajuste_de_fase(receta, "guia_estilo"))
@@ -5501,10 +6078,14 @@ def _que_hace(tarea_id, ctx, receta, modo="pendientes", solo_montar=False):
     if tarea_id == "piezas":
         # personajes y piezas de una vez: es lo que hace falta antes de los
         # planos, y por separado son dos botones porque cada uno paga lo suyo
-        return _un_paso(ctx, "assets", modo,
-                        {"tipos": ["reparto", "mapa", "grafico", "cabecera"],
-                         "replantear": False})
+        piezas = {"tipos": ["reparto", "mapa", "grafico", "cabecera"],
+                  "replantear": False}
+        if _es_flow(ctx):
+            return _correr_puerta_flow, (ctx, modo, piezas)
+        return _un_paso(ctx, "assets", modo, piezas)
     if tarea_id == "assets":
+        if _es_flow(ctx):
+            return _correr_puerta_flow, (ctx, modo, {})
         return _un_paso(ctx, "assets", modo, {"replantear": False})
     if tarea_id == "callouts":
         return _un_paso(ctx, "callouts", modo)
@@ -5528,6 +6109,10 @@ def _esta_al_dia(ctx, tarea):
     hace la pantalla para pintar su pastilla.
     """
     tid = tarea["id"]
+    if tid in ("assets", "piezas") and _es_flow(ctx):
+        return _flow_al_dia(ctx)
+    if tid == "guia_estilo" and _es_flow(ctx):
+        return True
     if tid in PASOS_POR_ID:
         # `al_dia` y no `estado_de`: el trabajo de la tanda se registra EN UN
         # PASO, asi que preguntar por el estado devuelve "ejecutando" -- el
@@ -6130,10 +6715,96 @@ def probar_claves(cuerpo: dict = Body(default=None)):
             "todo_bien": all(p["estado"] in ("ok", "sin_clave") for p in pruebas)}
 
 
+# ------------------------------------------------------ Google Vertex (imagenes)
+
+def _vertex_cfg():
+    if PASOS_MODULOS is None:
+        raise ErrorApi(503, f"los pasos no se han podido cargar: {ERROR_PASOS}")
+    return PASOS_MODULOS.vertex_cfg
+
+
+@app.get("/api/imagenes/vertex")
+def leer_vertex():
+    """La cuenta de servicio de Google Vertex (sin su clave), el modelo y donde."""
+    return _vertex_cfg().leer()
+
+
+@app.put("/api/imagenes/vertex")
+def guardar_vertex(cuerpo: dict = Body(default=None)):
+    """Sube la clave .json de la cuenta de servicio o cambia modelo/ubicacion."""
+    modulo = _vertex_cfg()
+    try:
+        salida = modulo.guardar(_cuerpo(cuerpo))
+    except ValueError as fallo:
+        raise ErrorApi(400, str(fallo))
+    anotar_global("vertex_configurado", {"listo": salida["listo"],
+                                         "modelo": salida["modelo"]})
+    return salida
+
+
+@app.post("/api/imagenes/vertex/probar")
+def probar_vertex():
+    """Habla con Vertex sin generar ninguna imagen (countTokens no se cobra)."""
+    try:
+        return _vertex_cfg().probar()
+    except Exception as fallo:  # noqa: BLE001
+        return {"estado": "mal", "mensaje": f"{type(fallo).__name__}: {fallo}"}
+
+
+# ------------------------------------------------------------ quien locuta
+
+def _voz_proveedor():
+    if PASOS_MODULOS is None:
+        raise ErrorApi(503, f"los pasos no se han podido cargar: {ERROR_PASOS}")
+    return PASOS_MODULOS.voz_proveedor
+
+
+@app.get("/api/voz/proveedor")
+def leer_proveedor_voz():
+    """Cartesia o ElevenLabs, y lo puesto de ElevenLabs (la clave, tapada)."""
+    return _voz_proveedor().leer()
+
+
+@app.put("/api/voz/proveedor")
+def guardar_proveedor_voz(cuerpo: dict = Body(default=None)):
+    """Cambia de proveedor o guarda la clave, la voz y el modelo de ElevenLabs.
+
+    NO toca ningun video: la voz ya grabada se queda como esta. Lo que cambia
+    es con quien se graba la proxima toma.
+    """
+    modulo = _voz_proveedor()
+    try:
+        salida = modulo.guardar(_cuerpo(cuerpo))
+    except ValueError as fallo:
+        raise ErrorApi(400, str(fallo))
+    anotar_global("voz_proveedor", {"proveedor": salida["proveedor"]})
+    return salida
+
+
+@app.post("/api/voz/proveedor/probar")
+def probar_proveedor_voz():
+    """Prueba la clave de ElevenLabs sin gastar creditos."""
+    modulo = _voz_proveedor()
+    cfg = modulo.configuracion()
+    return PASOS_MODULOS.comprobar_claves.probar_elevenlabs(
+        str(cfg.get("clave") or "").strip(), str(cfg.get("voz_id") or "").strip())
+
+
 @app.get("/api/claves/cli")
 def leer_cuentas_cli(refrescar: int = 0):
     """Las cuentas del CLI en orden, con quién hay logueado en cada una."""
-    return {"cuentas": _cuentas_cli_para_pantalla(bool(refrescar)),
+    cuentas = _cuentas_cli_para_pantalla(bool(refrescar))
+    # LA SESION CON LA QUE HABLA EL MOTOR SI NINGUNA CUENTA DE AQUI TIENE
+    # ENTRADA: la del propio CLI (`cli_claude.cuentas()`, `_candidatas_del_
+    # asistente`). Sin esto la pantalla decia «sin sesión» mientras el guion y
+    # el asistente funcionaban con ella: una cuenta anadida y nunca logueada
+    # no cuenta, pero tampoco apaga la de por defecto.
+    por_defecto = None
+    if not any(c.get("guardada") for c in cuentas):
+        cuenta = _CUENTA_POR_DEFECTO_CLI
+        sesion = _sesion_de(cuenta, bool(refrescar))
+        por_defecto = {"sesion": sesion, "salud": _salud_cli().de(cuenta)}
+    return {"cuentas": cuentas, "por_defecto": por_defecto,
             "max": _claves().MAX_CLI,
             "carpeta_base": _login_cli().CARPETA_CUENTAS}
 
@@ -7318,19 +7989,16 @@ def _resumen_de_tono(ficha):
 
 
 def _correr_light_voz(avisar, ctx, encargo):
-    """La voz, con el ritmo del montaje delante.
+    """La voz, elegida por como has dicho que suene.
 
-    DOS EJES, NO UNO. La velocidad de la voz y la duracion de un plano no son la
-    misma decision: un montaje rapido con voz normal funciona, y la voz al tope
-    sobre planos de dos segundos es un anuncio de teletienda. Asi que el ritmo
-    entra como DATO en el prompt —cambia que voz encaja, no solo cuanto corre— y
-    solo RELLENA la velocidad cuando el encargo no ha dicho nada de ella. Quien
-    dice si el encargo hablaba de velocidad es el propio modelo que lo ha leido
-    (`velocidad_pedida`), porque buscar «rapida» en el texto fallaria con «sin
-    prisa».
-
-    El AIRE entre bloques si lo pone el ritmo siempre: no es caracter de la voz,
-    es tiempo muerto de montaje.
+    EL RITMO NO ENTRA (desde el 27-09-2026). Antes entraba como dato en el
+    prompt, rellenaba la velocidad cuando el encargo no decia nada de ella y
+    ponia el aire entre bloques. Pero el ritmo decide cada cuanto cambia la
+    IMAGEN, y la voz del canal --a menudo una voz clonada-- tiene que sonar
+    igual a cualquier ritmo. Sin nada pedido, velocidad normal y el aire de
+    siempre; quien dice si el encargo hablaba de velocidad es el propio modelo
+    que lo ha leido (`velocidad_pedida`), porque buscar «rapida» en el texto
+    fallaria con «sin prisa».
     """
     light = _light()
     ficha_ritmo = light.ritmo_de(encargo.get("ritmo"))
@@ -7338,7 +8006,9 @@ def _correr_light_voz(avisar, ctx, encargo):
     elegido = PASOS_MODULOS.voz_descrita.proponer(
         encargo["voz_prompt"], idioma=encargo["idioma"], avisar=avisar,
         proyecto_id=ctx.id, cwd=ctx.proyecto.raiz, peticion=peticion,
-        ritmo=light.contexto_de_ritmo(encargo.get("ritmo")),
+        # sin el ritmo: contarselo empujaba a elegir una voz mas lenta o mas
+        # rapida segun el montaje, y la voz ya no depende de el
+        ritmo="",
         # la voz elegida a mano (la clonada del canal): el agente solo pone
         # los mandos
         voz_fija=encargo.get("voz_id") or "")
@@ -7346,10 +8016,14 @@ def _correr_light_voz(avisar, ctx, encargo):
                                        "velocidad", "emociones", "hueco_minimo")
                if elegido.get(c) is not None}
     cambios["idioma"] = encargo["idioma"]
+    # EL RITMO YA NO TOCA LA VOZ (27-09-2026). Si el encargo no dice nada de
+    # velocidad, la voz va a velocidad NORMAL -- no a la que sugiera el
+    # montaje -- y el aire entre bloques es el de siempre. El ritmo decide
+    # cada cuanto cambia la imagen; la voz del canal suena igual a cualquiera.
     rellenada = not elegido.get("velocidad_pedida")
     if rellenada:
-        cambios["velocidad"] = ficha_ritmo["velocidad"]
-    cambios["hueco_minimo"] = ficha_ritmo["hueco_minimo"]
+        cambios["velocidad"] = "normal"
+    cambios["hueco_minimo"] = PASOS_MODULOS.p4_voz.HUECO_POR_DEFECTO
     ctx.estado.actualizar_params("voz", cambios)
     ctx.bitacora.anotar("voz_descrita", "voz", {
         "encargo": encargo["voz_prompt"][:200],
@@ -7429,6 +8103,14 @@ def _correr_light_muestra(avisar, ctx, encargo):
 
     avisar(0.1, "buscando las referencias del estilo")
     laminas = _laminas_del_estilo(ctx)
+    if not laminas and light.imagenes_con_flow():
+        # CON FLOW NO HAY LAMINAS DIBUJADAS: la muestra se monta sobre las
+        # imagenes que se subieron con la descripcion, si las hay. Sin ninguna
+        # el estilo se guarda sin muestras -- no se paga una imagen para esto.
+        laminas = _aportadas_del_taller(ctx)[:4]
+        if not laminas:
+            avisar(1.0, "sin imágenes con las que montar las muestras")
+            return {"laminas": []}
     if not laminas:
         raise RuntimeError("este estilo no tiene ninguna referencia dibujada "
                            "con la que hacer las muestras")
@@ -7723,13 +8405,22 @@ def listar_presets_light():
             "max_imagenes_estilo": light.max_imagenes_estilo(),
             # El deslizador de ritmo, con las dos unicas cifras que ensena: el
             # plano medio y lo que cuesta un minuto de video a ese ritmo.
-            "ritmos": [light.ficha_de_ritmo(r["id"]) for r in light.RITMOS],
+            "ritmos": [light.ficha_de_ritmo(
+                r["id"], "vertex" if AJUSTES.leer().get("imagenes") == "vertex"
+                else AJUSTES.calidad_imagen()) for r in light.RITMOS],
             "ritmo_por_defecto": light.RITMO_POR_DEFECTO,
+            # con Google Flow el ritmo se cuenta en imagenes por minuto y no
+            # en dolares, y el estilo no dibuja laminas
+            "imagenes_flow": light.imagenes_con_flow(),
+            # quien locuta: con ElevenLabs los selectores de voces de Cartesia
+            # no deciden nada y la pantalla lo dice en su sitio
+            "voz_proveedor": PASOS_MODULOS.voz_proveedor.leer()["proveedor"],
             "sueltos": _talleres_sueltos(),
             "tareas": [{"id": t["id"], "nombre": t["nombre"],
                         "porque": t.get("porque", ""), "cuesta": t["cuesta"],
                         "imagenes": t.get("imagenes") or 0,
-                        "solo": t.get("solo") or ""} for t in light.TAREAS]}
+                        "solo": t.get("solo") or ""}
+                       for t in light.tareas_de(None)]}
 
 
 @app.post("/api/presets-light/plan")
@@ -8048,6 +8739,59 @@ def regenerar_preset_light(preset_id: str, cuerpo: dict = Body(default=None)):
             "eventos": f"/api/trabajos/{trabajo_id}/eventos"}
 
 
+def _texto_en_pantalla_o_400(crudo):
+    """Los mandos de «Texto en pantalla», validados. -> dict de params de callouts.
+
+    Se validan aqui y no en la pantalla: un valor que p7 no entiende no da
+    error al guardarlo, lo da -- o peor, no lo da -- al montar el video.
+    """
+    p7 = PASOS_MODULOS.p7_callouts
+    limpio = {}
+    if "subtitulo_tam" in crudo:
+        tam = str(crudo["subtitulo_tam"] or "normal").strip().lower()
+        if tam not in p7.SUB_TAMANOS:
+            raise ErrorApi(400, f"tamaño de subtítulo {tam!r}: "
+                                + ", ".join(p7.SUB_TAMANOS))
+        limpio["subtitulo_tam"] = tam
+    if "subtitulo_caja" in crudo:
+        caja = crudo["subtitulo_caja"]
+        if caja in (None, "", "auto"):
+            limpio["subtitulo_caja"] = "auto"
+        else:
+            try:
+                limpio["subtitulo_caja"] = max(0.0, min(1.0, float(caja)))
+            except (TypeError, ValueError):
+                raise ErrorApi(400, "la caja del subtítulo es 'auto' o un número de 0 a 1")
+    if "subtitulo_animacion" in crudo:
+        animacion = str(crudo["subtitulo_animacion"] or "auto").strip().lower()
+        if animacion not in ("auto", "fundido", "corte"):
+            raise ErrorApi(400, "la animación del subtítulo es auto, fundido o corte")
+        limpio["subtitulo_animacion"] = animacion
+    if "diseno" in crudo:
+        diseno = str(crudo["diseno"] or "").strip().lower()
+        if diseno not in p7.SETS_DISENO:
+            raise ErrorApi(400, f"diseño {diseno!r}: " + ", ".join(p7.SETS_DISENO))
+        limpio["diseno"] = diseno
+    return limpio
+
+
+@app.put("/api/proyectos/{pid}/texto")
+def guardar_texto_video(pid: str, cuerpo: dict = Body(default=None)):
+    """«Texto en pantalla» de ESTE video: van a los params de los rotulos.
+
+    Cambiarlo deja los rotulos obsoletos y el MP4 detras; volver a montar no
+    toca ninguna imagen ni la voz, asi que no cuesta nada.
+    """
+    ctx = contexto(pid)
+    cambios = _texto_en_pantalla_o_400(_cuerpo(cuerpo))
+    if cambios:
+        ctx.estado.actualizar_params("callouts", cambios)
+    return {"params": {k: (ctx.estado.params("callouts") or {}).get(k)
+                       for k in ("subtitulo_tam", "subtitulo_caja",
+                                 "subtitulo_animacion", "diseno")},
+            "estado": ctx.estado.estado_de("callouts")}
+
+
 @app.put("/api/presets-light/{preset_id}")
 def editar_preset_light(preset_id: str, cuerpo: dict = Body(default=None)):
     """El nombre, el idioma y la guia de tono: lo que se cambia a mano.
@@ -8085,6 +8829,15 @@ def editar_preset_light(preset_id: str, cuerpo: dict = Body(default=None)):
 
     contenido = copy.deepcopy(ficha.get("datos") or {})
 
+    # EL TEXTO EN PANTALLA, a mano y sin coste: el tamano, la caja y la
+    # animacion del subtitulo y el set de diseno. Van al bloque de grafismo del
+    # estilo ('rotulos', ver presets_canal.TIPOS), que es lo que se aplica a
+    # cada video nuevo. No toca ningun video hecho.
+    if isinstance(datos.get("texto"), dict):
+        rotulos = dict(contenido.get("rotulos") or {})
+        rotulos.update(_texto_en_pantalla_o_400(datos["texto"]))
+        contenido["rotulos"] = rotulos
+
     # EL RITMO TAMPOCO REGENERA NADA: escribe los mismos tres campos de duracion
     # que el modo editor tiene en su tarjeta de estilo, mas el aire entre
     # bloques. Lo que NO toca es la velocidad de la voz: esa se decidio una vez
@@ -8106,8 +8859,7 @@ def editar_preset_light(preset_id: str, cuerpo: dict = Body(default=None)):
         estilo = dict(contenido.get("estilo") or {})
         estilo.update(cambios_ritmo["assets"])
         contenido["estilo"] = estilo
-        if contenido.get("voz"):
-            contenido["voz"] = dict(contenido["voz"], **cambios_ritmo["voz"])
+        # (la voz no: el ritmo ya no la toca, ver `presets_light.params_de_ritmo`)
         contenido.setdefault("origen", {})["ritmo"] = ritmo
         try:
             _sembrar_taller(_taller_de(ficha), {"idioma": presets.idioma_de(ficha)
@@ -8485,6 +9237,14 @@ def _coste_previsto(ctx, pestanas):
     usd_caracter = float(((tarifas.get("tts") or {}).get("usd_por_caracter")) or 0.0)
 
     imagenes = planos["con_imagen"] if "video" in pestanas else 0
+    # CON FLOW LAS IMAGENES NO SE PAGAN: se hacen a mano. Se sigue diciendo
+    # cuantas son --es el trabajo que queda-- pero a cero dolares.
+    flow = _es_flow(ctx)
+    if flow:
+        usd_imagen = 0.0
+    elif assets.get("motor_imagen") == "vertex":
+        # Nano Banana no tiene calidades: un precio por imagen
+        usd_imagen = light.USD_POR_IMAGEN["vertex"]
     caracteres = 0
     if "voz" in pestanas:
         brief = PASOS_MODULOS.comun.leer_salida(
@@ -8500,6 +9260,12 @@ def _coste_previsto(ctx, pestanas):
         else:
             caracteres = int(round(palabras * 6.1))
     usd_imagenes = round(imagenes * usd_imagen, 3)
+    # CON ELEVENLABS LA VOZ NO SE PAGA POR CARACTER: sale de los creditos de su
+    # plan. La tarifa de la tabla es la de Cartesia y aplicarla seria inventar
+    # una factura; se dicen los caracteres, que es lo que gasta de verdad.
+    voz_proveedor = PASOS_MODULOS.voz_proveedor.leer()["proveedor"]
+    if voz_proveedor == "elevenlabs":
+        usd_caracter = 0.0
     usd_tts = round(caracteres * usd_caracter, 4)
     # LO QUE YA ESTA HECHO VIAJA AL LADO DEL TECHO, no en su lugar. El total
     # sigue siendo lo que cuesta el video entero --que es lo que hay que pagar
@@ -8515,6 +9281,7 @@ def _coste_previsto(ctx, pestanas):
             "usd_por_generar": round(por_generar * usd_imagen + usd_tts, 3),
             "caracteres": caracteres, "usd_tts": usd_tts,
             "usd_total": round(usd_imagenes + usd_tts, 3),
+            "imagenes_flow": flow, "voz_proveedor": voz_proveedor,
             "planos": planos}
 
 
@@ -8970,6 +9737,12 @@ def crear_video_light(preset_id: str, cuerpo: dict = Body(default=None)):
     # camino que copiara las claves a mano se quedaria viejo el dia que un
     # preset guarde una mas.
     aplicado = aplicar_preset_canal(proyecto.id, preset_id)
+    # DESPUES del estilo: el preset escribe sus params de assets y esto va
+    # encima. Con «Imagenes: Google Flow» el video nace adoptando.
+    try:
+        _preparar_flow_al_crear(ctx)
+    except Exception as fallo:  # noqa: BLE001
+        ctx.bitacora.anotar("aviso", "assets", {"flow_al_crear": str(fallo)})
     avisos = _sembrar_video_light(ctx, datos)
     ctx.bitacora.anotar("video_light_creado", None, {
         "preset": preset_id, "estilo": ficha_preset.get("nombre"),
@@ -9596,8 +10369,8 @@ def fichero_web(fichero: str, peticion: Request):
 
 def main():
     parser = argparse.ArgumentParser(description="Servicio HTTP del Estudio de Video")
-    parser.add_argument("--puerto", type=int, default=8020)
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--puerto", type=int, default=int(os.environ.get("ESTUDIO_PUERTO", 8020)))
+    parser.add_argument("--host", default=os.environ.get("ESTUDIO_HOST", "127.0.0.1"))
     parser.add_argument("--proyectos", default=None,
                         help="carpeta base de proyectos "
                              f"(por defecto {RAIZ_POR_DEFECTO})")
@@ -9609,7 +10382,20 @@ def main():
     os.environ.setdefault("ESTUDIO_API", f"http://127.0.0.1:{argumentos.puerto}")
 
     import uvicorn
-    print(f"Estudio de Video en http://{argumentos.host}:{argumentos.puerto}")
+    import socket
+    if argumentos.host in ("0.0.0.0", "::"):
+        print(f"Estudio de Video escuchando en:")
+        print(f"  • Local:           http://localhost:{argumentos.puerto}")
+        try:
+            nombre_equipo = socket.gethostname()
+            ips = socket.gethostbyname_ex(nombre_equipo)[2]
+            ips_locales = [ip for ip in ips if not ip.startswith("127.")]
+            for ip in ips_locales:
+                print(f"  • En tu red Wi-Fi: http://{ip}:{argumentos.puerto}")
+        except Exception:
+            pass
+    else:
+        print(f"Estudio de Video en http://{argumentos.host}:{argumentos.puerto}")
     print(f"proyectos en {raiz_proyectos()}")
     if ERROR_PASOS:
         print(f"AVISO: los pasos no se han cargado -> {ERROR_PASOS}")

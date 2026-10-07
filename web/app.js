@@ -386,6 +386,20 @@ const API = {
   ajustesCLI: () => `${BASE}/api/ajustes-cli`,
   claves: () => `${BASE}/api/claves`,
   ajustes: () => `${BASE}/api/ajustes`,
+  vozProveedor: () => `${BASE}/api/voz/proveedor`,
+  vertex: () => `${BASE}/api/imagenes/vertex`,
+  probarVertex: () => `${BASE}/api/imagenes/vertex/probar`,
+  probarVozProveedor: () => `${BASE}/api/voz/proveedor/probar`,
+  flow: pid => `${BASE}/api/proyectos/${encodeURIComponent(pid)}/flow`,
+  flowExportar: pid => `${BASE}/api/proyectos/${encodeURIComponent(pid)}/flow/exportar`,
+  flowImportar: pid => `${BASE}/api/proyectos/${encodeURIComponent(pid)}/flow/importar`,
+  flowTanda: pid => `${BASE}/api/proyectos/${encodeURIComponent(pid)}/flow/tanda.json`,
+  flowVideos: pid => `${BASE}/api/proyectos/${encodeURIComponent(pid)}/flow/videos`,
+  escenaVideo: (pid, sid) => `${BASE}/api/proyectos/${encodeURIComponent(pid)}/escenas/${encodeURIComponent(sid)}/video`,
+  escenaFlowPrompt: (pid, sid) => `${BASE}/api/proyectos/${encodeURIComponent(pid)}/escenas/${encodeURIComponent(sid)}/flow-prompt`,
+  mirilla: pid => `${BASE}/api/proyectos/${encodeURIComponent(pid)}/render/mirilla`,
+  publicar: pid => `${BASE}/api/proyectos/${encodeURIComponent(pid)}/publicar`,
+  textoVideo: pid => `${BASE}/api/proyectos/${encodeURIComponent(pid)}/texto`,
   cuentasCLI: refrescar => `${BASE}/api/claves/cli${refrescar ? '?refrescar=1' : ''}`,
   entrarCLI: cid => `${BASE}/api/claves/cli/${encodeURIComponent(cid)}/entrar`,
   codigoCLI: cid => `${BASE}/api/claves/cli/${encodeURIComponent(cid)}/codigo`,
@@ -788,14 +802,78 @@ function nombreDe(id) {
 /* ------------------------------------------------------------------ avisos */
 
 let relojToast = null;
+const HISTORIAL_NOTIFICACIONES = [];
+let notificacionesNoLeidas = 0;
 
-function toast(texto, malo) {
+function agregarNotificacion(texto, malo, paso) {
+  const d = new Date();
+  const hora = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  HISTORIAL_NOTIFICACIONES.unshift({
+    id: Date.now() + Math.random(),
+    hora,
+    texto: String(texto || ''),
+    malo: !!malo,
+    paso: paso || ''
+  });
+  if (HISTORIAL_NOTIFICACIONES.length > 60) HISTORIAL_NOTIFICACIONES.pop();
+  notificacionesNoLeidas++;
+  actualizarBadgeNotificaciones();
+  pintarNotificaciones();
+}
+
+function actualizarBadgeNotificaciones() {
+  const badge = $('#badge-notificaciones');
+  if (!badge) return;
+  if (notificacionesNoLeidas > 0) {
+    badge.textContent = notificacionesNoLeidas > 99 ? '99+' : notificacionesNoLeidas;
+    badge.classList.remove('oculto');
+  } else {
+    badge.classList.add('oculto');
+  }
+}
+
+function pintarNotificaciones() {
+  const cuerpo = $('#cuerpo-notificaciones');
+  if (!cuerpo) return;
+  vaciar(cuerpo);
+  if (!HISTORIAL_NOTIFICACIONES.length) {
+    cuerpo.appendChild(h('div', { clase: 'vacio' }, 'No hay avisos ni errores registrados.'));
+    return;
+  }
+  HISTORIAL_NOTIFICACIONES.forEach(n => {
+    const item = h('div', { clase: n.malo ? 'item-notif malo' : 'item-notif' },
+      h('div', { clase: 'cab-notif' },
+        h('span', { clase: 'tag-notif' }, n.malo ? (n.paso ? `Error en ${n.paso}` : 'Error') : (n.paso || 'Aviso')),
+        h('span', { clase: 'fecha-notif' }, n.hora)
+      ),
+      h('div', { clase: 'texto-notif' }, n.texto)
+    );
+    cuerpo.appendChild(item);
+  });
+}
+
+function alternarNotificaciones(forzar) {
+  const panel = $('#notificaciones');
+  if (!panel) return;
+  const abrir = typeof forzar === 'boolean' ? forzar : panel.classList.contains('plegado');
+  if (abrir) {
+    panel.classList.remove('plegado');
+    notificacionesNoLeidas = 0;
+    actualizarBadgeNotificaciones();
+    pintarNotificaciones();
+  } else {
+    panel.classList.add('plegado');
+  }
+}
+
+function toast(texto, malo, paso) {
+  agregarNotificacion(texto, malo, paso);
   const n = $('#toast');
   n.textContent = texto;
   n.classList.toggle('malo', !!malo);
   n.classList.add('ver');
   clearTimeout(relojToast);
-  relojToast = setTimeout(() => n.classList.remove('ver'), malo ? 6000 : 3000);
+  relojToast = setTimeout(() => n.classList.remove('ver'), malo ? 7000 : 3500);
 }
 
 /* Todo fallo acaba aqui: se ve en la propia pestana, no solo en consola. En la
@@ -814,9 +892,12 @@ const ERRORES = {};
 
 function mostrarError(paso, error) {
   const crudo = error && error.message ? error.message : String(error);
+  if (/429|RESOURCE_EXHAUSTED/i.test(crudo)) {
+    mostrarModalCuota429Error({ error: crudo, paso });
+  }
   ERRORES[paso] = crudo;
   pintarError(paso);
-  toast(partirError(crudo).titular, true);
+  toast(crudo, true, paso);
   console.error(error);
 }
 
@@ -849,6 +930,169 @@ function limpiarError(paso) {
   // TODOS: si no, un fallo anterior se queda pintado en otro lanzador del mismo
   // paso mientras el de aquí arranca, y se lee como si acabara de fallar
   $('#panel').querySelectorAll(`[data-error="${paso}"]`).forEach(vaciar);
+}
+
+/* ==================================================== MODAL DE CUOTA 429
+ *
+ * Cuando Vertex AI (Google Cloud) responde HTTP 429 RESOURCE_EXHAUSTED, el backend
+ * entra en una espera con cuenta atrás por segundos antes de reintentar.
+ * Aquí mostramos un modal visual con temporizador para que el usuario sepa
+ * exactamente qué ocurre, cuánto falta y qué plano se está generando.
+ */
+let MODAL_429 = { el: null, relojTimer: null, restante: 0, total: 0 };
+
+function cerrarModalCuota429() {
+  if (MODAL_429.relojTimer) {
+    clearInterval(MODAL_429.relojTimer);
+    MODAL_429.relojTimer = null;
+  }
+  if (MODAL_429.el) {
+    MODAL_429.el.remove();
+    MODAL_429.el = null;
+  }
+}
+
+function mostrarModalCuota429({ restante, total, intento, reintentos, plano, tid, paso }) {
+  MODAL_429.restante = Math.max(0, parseInt(restante, 10) || 0);
+  MODAL_429.total = Math.max(1, parseInt(total, 10) || MODAL_429.restante || 1);
+
+  let modal = $('#modal-cuota-429');
+  if (!modal) {
+    modal = h('div', {
+      id: 'modal-cuota-429',
+      style: 'position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 99999; display: flex; align-items: center; justify-content: center; backdrop-filter: blur(5px);'
+    });
+    document.body.appendChild(modal);
+    MODAL_429.el = modal;
+  }
+
+  vaciar(modal);
+
+  const porcentaje = Math.max(0, Math.min(100, Math.round(((MODAL_429.total - MODAL_429.restante) / MODAL_429.total) * 100)));
+
+  const tarjeta = h('div', {
+    clase: 'tarjeta-cuota-429',
+    style: 'background: #1e1e24; border: 1px solid #444; border-radius: 14px; padding: 28px 24px; max-width: 480px; width: 92%; box-shadow: 0 20px 50px rgba(0,0,0,0.7); text-align: center; color: #f0f0f0; font-family: inherit;'
+  },
+    h('div', { style: 'font-size: 38px; margin-bottom: 8px;' }, '⏳'),
+    h('h3', { style: 'margin: 0 0 10px 0; font-size: 20px; font-weight: 700; color: #ffca28;' },
+      'Límite de cuota alcanzado (HTTP 429)'),
+    h('p', { style: 'margin: 0 0 20px 0; font-size: 14px; color: #ccc; line-height: 1.5;' },
+      plano
+        ? 'Google Vertex AI ha alcanzado el límite de peticiones por minuto al generar el plano '
+        : 'Google Vertex AI ha alcanzado el límite de peticiones por minuto. ',
+      plano ? h('strong', { style: 'color: #fff; background: rgba(255,255,255,0.15); padding: 2px 6px; border-radius: 4px;' }, plano) : null,
+      h('br'),
+      'El sistema está esperando para que Google renueve la cuota y reintentará automáticamente.'
+    ),
+    h('div', {
+      style: 'margin: 0 auto 20px auto; width: 100px; height: 100px; border-radius: 50%; border: 4px solid #333; border-top-color: #ffca28; display: flex; flex-direction: column; align-items: center; justify-content: center; font-size: 28px; font-weight: 800; color: #fff; background: rgba(0,0,0,0.3);'
+    },
+      h('span', { id: 'modal-cuota-segundos' }, `${MODAL_429.restante}s`),
+      h('span', { style: 'font-size: 11px; font-weight: 400; color: #aaa;' }, 'restantes')
+    ),
+    h('div', { style: 'background: #2a2a32; border-radius: 6px; height: 8px; width: 100%; overflow: hidden; margin-bottom: 14px;' },
+      h('div', {
+        id: 'modal-cuota-barra',
+        style: `height: 100%; width: ${porcentaje}%; background: #ffca28; transition: width 0.3s ease;`
+      })
+    ),
+    h('div', { style: 'font-size: 12px; color: #888; margin-bottom: 22px;' },
+      intento && reintentos ? `Intento ${intento} de ${reintentos}` : 'Reintentando en breve…'
+    ),
+    h('div', { style: 'display: flex; justify-content: center; gap: 12px;' },
+      h('button', {
+        clase: 'mini fantasma',
+        style: 'padding: 8px 16px; border-radius: 6px;',
+        onclick: () => cerrarModalCuota429()
+      }, 'Cerrar aviso (esperar en segundo plano)'),
+      paso ? h('button', {
+        clase: 'mini peligro',
+        style: 'padding: 8px 16px; border-radius: 6px;',
+        onclick: () => {
+          cerrarModalCuota429();
+          cancelar(paso);
+        }
+      }, 'Parar generación') : null
+    )
+  );
+
+  modal.appendChild(tarjeta);
+
+  if (MODAL_429.relojTimer) clearInterval(MODAL_429.relojTimer);
+  MODAL_429.relojTimer = setInterval(() => {
+    if (MODAL_429.restante > 0) {
+      MODAL_429.restante -= 1;
+      const elSeg = document.getElementById('modal-cuota-segundos');
+      if (elSeg) elSeg.textContent = `${MODAL_429.restante}s`;
+      const elBarra = document.getElementById('modal-cuota-barra');
+      if (elBarra) {
+        const pct = Math.max(0, Math.min(100, Math.round(((MODAL_429.total - MODAL_429.restante) / MODAL_429.total) * 100)));
+        elBarra.style.width = `${pct}%`;
+      }
+    }
+  }, 1000);
+}
+
+function mostrarModalCuota429Error({ error, plano, paso }) {
+  cerrarModalCuota429();
+  const modal = h('div', {
+    id: 'modal-cuota-429',
+    style: 'position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 99999; display: flex; align-items: center; justify-content: center; backdrop-filter: blur(5px);'
+  });
+  document.body.appendChild(modal);
+  MODAL_429.el = modal;
+
+  const sidMatch = String(error || '').match(/Plano\s+([A-Za-z0-9_]+)/i);
+  const sid = plano || (sidMatch ? sidMatch[1] : '');
+
+  const tarjeta = h('div', {
+    style: 'background: #1e1e24; border: 1px solid #d32f2f; border-radius: 14px; padding: 28px 24px; max-width: 500px; width: 92%; box-shadow: 0 20px 50px rgba(0,0,0,0.7); text-align: center; color: #f0f0f0;'
+  },
+    h('div', { style: 'font-size: 38px; margin-bottom: 8px;' }, '🛑'),
+    h('h3', { style: 'margin: 0 0 10px 0; font-size: 20px; font-weight: 700; color: #ff5252;' },
+      'Cuota de Vertex AI temporalmente agotada'),
+    h('p', { style: 'margin: 0 0 16px 0; font-size: 14px; color: #ccc; line-height: 1.5;' },
+      sid
+        ? `Se agotó la cuota por minuto de Google Cloud Vertex AI generando el plano ${sid}.`
+        : 'Se agotó la cuota por minuto de Google Cloud Vertex AI.',
+      h('br'),
+      'Google suele restablecer la cuota automáticamente tras 30 a 60 segundos.'
+    ),
+    h('div', { style: 'display: flex; justify-content: center; gap: 12px; margin-top: 20px;' },
+      sid ? h('button', {
+        clase: 'primario',
+        style: 'padding: 8px 18px;',
+        onclick: () => {
+          cerrarModalCuota429();
+          encolarImagen(sid, (PREVIA && PREVIA.borrador && PREVIA.borrador[sid]) || '');
+        }
+      }, `⟳ Reintentar ${sid} ahora`) : null,
+      h('button', {
+        clase: 'mini fantasma',
+        style: 'padding: 8px 16px;',
+        onclick: () => cerrarModalCuota429()
+      }, 'Cerrar')
+    )
+  );
+
+  modal.appendChild(tarjeta);
+}
+
+function comprobarCuota429(datos, tid, paso) {
+  if (!datos) return;
+  const texto = String(datos.mensaje || datos.publico || '');
+  const m = texto.match(/cuota_429:(\d+):(\d+):(\d+):(\d+)(?::([A-Za-z0-9_]+))?/);
+  if (m) {
+    const restante = parseInt(m[1], 10);
+    const total = parseInt(m[2], 10);
+    const intento = parseInt(m[3], 10);
+    const reintentos = parseInt(m[4], 10);
+    const plano = m[5] || '';
+    mostrarModalCuota429({ restante, total, intento, reintentos, plano, tid, paso });
+  } else if (MODAL_429.el && datos.estado === 'ejecutando' && !texto.includes('cuota_429')) {
+    cerrarModalCuota429();
+  }
 }
 
 /* ------------------------------------------------------------------ trabajos */
@@ -900,6 +1144,12 @@ function seguirTrabajo(paso, tid, alTerminar, alAvanzar) {
 
   const aplicar = datos => {
     if (!datos || APP.seguimientos[paso] !== seguimiento) return;
+    /* UN TRABAJO OLVIDADO ES UN TRABAJO CORTADO: el servidor se reinició y ya
+       no lo conoce. Sin esto la barra se quedaba en su último porcentaje. */
+    if (datos.estado === 'olvidado') {
+      terminar({ estado: 'error', error: TRABAJO_OLVIDADO });
+      return;
+    }
     const actual = APP.trabajos[paso] || {};
     APP.trabajos[paso] = Object.assign({}, actual, datos,
       { id: tid, inicio: actual.inicio, muestras: actual.muestras });
@@ -910,6 +1160,7 @@ function seguirTrabajo(paso, tid, alTerminar, alAvanzar) {
     // el medidor de la cabecera se mueve con el mismo flujo que la barra: lo
     // que se esta gastando se ve mientras se gasta, no al terminar
     refrescarCoste();
+    comprobarCuota429(datos, tid, paso);
     if (['listo', 'error', 'cancelado'].includes(datos.estado)) terminar(datos);
   };
 
@@ -918,14 +1169,22 @@ function seguirTrabajo(paso, tid, alTerminar, alAvanzar) {
     refrescarCoste(true);
     const segundos = datos.segundos || (Date.now() - (APP.trabajos[paso].inicio || Date.now())) / 1000;
     if (datos.estado === 'listo') {
+      cerrarModalCuota429();
       anotarDuracion(paso, segundos);
       // LO PUBLICO, no el mensaje interno del paso: lo que se dice en el
       // aviso es lo mismo que dice la barra mientras corre.
       const dicho = avancePublico(datos) || 'terminado';
       toast(`${nombreDe(paso)}: ${dicho} (${duracionCorta(segundos)})`);
     } else if (datos.estado === 'error') {
-      mostrarError(paso, datos.error || datos.mensaje || 'el trabajo ha fallado');
+      const errTexto = datos.error || datos.mensaje || 'el trabajo ha fallado';
+      if (/429|RESOURCE_EXHAUSTED/i.test(errTexto)) {
+        mostrarModalCuota429Error({ error: errTexto, paso });
+      } else {
+        cerrarModalCuota429();
+      }
+      mostrarError(paso, errTexto);
     } else {
+      cerrarModalCuota429();
       toast(`${nombreDe(paso)}: cancelado`, true);
     }
     try {
@@ -962,12 +1221,40 @@ function seguirTrabajo(paso, tid, alTerminar, alAvanzar) {
 
   function arrancarSondeo() {
     if (seguimiento.sondeo || APP.seguimientos[paso] !== seguimiento) return;
+    let fallos = 0;
     seguimiento.sondeo = setInterval(async () => {
-      try { aplicar(await pedir(API.trabajo(tid))); }
-      catch (e) { /* el servidor puede tardar en publicar el trabajo */ }
+      try {
+        const datos = await pedir(API.trabajo(tid));
+        if (fallos >= FALLOS_SIN_SERVIDOR) limpiarError(paso);
+        fallos = 0;
+        aplicar(datos);
+      } catch (e) {
+        fallos += 1;
+        /* EL SERVIDOR CONTESTA PERO YA NO CONOCE EL TRABAJO: se reinició. Los
+           primeros segundos se perdonan, que es lo que tarda en publicarlo. */
+        if (!/no hay respuesta del servidor/.test(e.message) && fallos > 5) {
+          terminar({ estado: 'error', error: TRABAJO_OLVIDADO });
+          return;
+        }
+        /* NO CONTESTA: se dice, y se sigue preguntando por si vuelve. Antes
+           cada pregunta fallaba en silencio y la barra se quedaba congelada. */
+        if (fallos === FALLOS_SIN_SERVIDOR) {
+          mostrarError(paso, 'Se ha perdido la conexión con el servidor: puede que '
+            + 'se haya cerrado (mira la ventana donde arrancaste app.py) o que el '
+            + 'equipo vaya muy cargado. Se sigue intentando; si vuelve, esto '
+            + 'desaparece solo.');
+          if (typeof pintarLight === 'function') pintarLight();
+        }
+      }
     }, 1000);
   }
 }
+
+/* Cuántos sondeos seguidos sin respuesta antes de decir que el servidor no
+   contesta (uno por segundo). */
+const FALLOS_SIN_SERVIDOR = 8;
+const TRABAJO_OLVIDADO = 'El servidor se reinició y este trabajo se cortó. Lo ya '
+  + 'hecho se conserva: vuelve a lanzarlo y seguirá por donde iba.';
 
 function soltarSeguimiento(paso) {
   const s = APP.seguimientos[paso];
@@ -2175,6 +2462,10 @@ function estadoConfig() {
          CLI: se piden en otra llamada, y ademas traen la tabla de costes,
          que se lee de las tarifas y no del almacen de claves. */
       ajustes: null,
+      /* Quién locuta (Cartesia o ElevenLabs), de `/api/voz/proveedor`. */
+      voz: null, vozPrueba: null,
+      /* La cuenta de Google Vertex (imágenes con Nano Banana). */
+      vertex: null, vertexPrueba: null,
       /* Lo que se está tecleando en cada caja de código. Vive aquí y no en el
          DOM porque `pintarConfig()` vacía y reconstruye la pantalla entera
          después de CADA guardado: sin esto, guardar una etiqueta borraría el
@@ -2208,6 +2499,8 @@ async function cargarClaves() {
   }
   cargarCuentasCLI();
   cargarAjustes();
+  cargarVozProveedor();
+  cargarVertex();
   return vista.ficha;
 }
 
@@ -2276,8 +2569,12 @@ function pintarConfig() {
     return;
   }
   caja.appendChild(bloquePruebaClaves());
+  /* LO QUE SE ELIGE VA ANTES QUE SUS CLAVES: de dónde salen las imágenes y
+     quién locuta deciden qué claves hacen falta de verdad. */
+  caja.appendChild(seccionImagenes());
   caja.appendChild(seccionOpenAI(ficha));
-  caja.appendChild(seccionCalidadImagen());
+  if (motorDeImagenes() === 'openai') caja.appendChild(seccionCalidadImagen());
+  caja.appendChild(seccionVoz());
   caja.appendChild(seccionCartesia(ficha));
   caja.appendChild(seccionCLI());
   caja.appendChild(seccionOtrasClaves(ficha));
@@ -2405,9 +2702,12 @@ function seccionOpenAI(ficha) {
         ? pastillaEstado('error', 'sin crédito')
         : pastillaEstado(puesta ? 'ok' : 'vacio',
           puesta ? cuenta.cola : 'sin poner'))),
-    h('div', { clase: 'pista' },
-      'La clave con la que se generan las imágenes. Imprescindible, como la de '
-      + 'Cartesia y la cuenta de Claude: sin ella no hay planos que montar.'),
+    h('div', { clase: 'pista' }, motorDeImagenes() !== 'openai'
+      ? `No se usa: los vídeos nuevos hacen las imágenes con ${motorDeImagenes() === 'flow'
+        ? 'Google Flow, a mano' : 'Google Vertex'}. Solo hace falta si vuelves a `
+        + 'OpenAI o para vídeos hechos antes con él.'
+      : 'La clave con la que se generan las imágenes. Imprescindible, como la de '
+        + 'la voz y la cuenta de Claude: sin ella no hay planos que montar.'),
     h('div', { clase: 'fila-clave' }, campo,
       h('button', {
         clase: 'mini',
@@ -2449,8 +2749,10 @@ function seccionCartesia(ficha) {
       h('span', { clase: 'crece' }),
       pastillaEstado(ficha.cartesia.puesta ? 'ok' : 'vacio',
         ficha.cartesia.puesta ? ficha.cartesia.cola : 'sin poner')),
-    h('div', { clase: 'pista' },
-      'Una sola, y no se reparte: la locución se sintetiza de una tirada.'),
+    h('div', { clase: 'pista' }, vozConElevenLabs()
+      ? 'No se usa ahora mismo: locuta ElevenLabs (arriba). Se queda guardada '
+        + 'para volver a Cartesia cuando quieras.'
+      : 'Una sola, y no se reparte: la locución se sintetiza de una tirada.'),
     h('div', { clase: 'fila-clave' }, campo,
       h('button', {
         clase: 'mini',
@@ -2461,6 +2763,313 @@ function seccionCartesia(ficha) {
         },
       }, 'Cambiar')));
 }
+
+/* ================================================ imágenes y voz: QUIÉN LAS HACE
+ *
+ * Dos decisiones de la instalación, no de un vídeo, y por eso viven aquí:
+ *
+ *   imágenes   OpenAI (se generan y se pagan) o Google Flow (se hacen a mano
+ *              con la extensión de Chrome y el Estudio las recoge). Es el
+ *              punto de partida de los vídeos NUEVOS, como la calidad: se
+ *              escribe al crear el vídeo y no toca los que ya existen.
+ *   voz        Cartesia o ElevenLabs. Lo que cambia es con quién se graba la
+ *              próxima toma; ninguna voz ya grabada se toca.
+ */
+function imagenesConFlow() {
+  const datos = estadoConfig().ajustes;
+  if (datos && datos.ajustes) return datos.ajustes.imagenes === 'flow';
+  return !!((APP.light && APP.light.datos) || {}).imagenes_flow;
+}
+
+/* 'openai' | 'vertex' | 'flow': quién hace las imágenes de los vídeos nuevos. */
+function motorDeImagenes() {
+  const datos = estadoConfig().ajustes;
+  if (datos && datos.ajustes && datos.ajustes.imagenes) return datos.ajustes.imagenes;
+  return imagenesConFlow() ? 'flow' : 'openai';
+}
+
+function vozConElevenLabs() {
+  const voz = estadoConfig().voz;
+  if (voz) return voz.proveedor === 'elevenlabs';
+  return ((APP.light && APP.light.datos) || {}).voz_proveedor === 'elevenlabs';
+}
+
+/* Lo que se enseña donde se elegiría una voz de Cartesia cuando locuta
+   ElevenLabs: esa lista no decide nada, la voz es la de Configuración. */
+function avisoVozElevenLabs() {
+  return h('div', { clase: 'pista' },
+    'Locuta ElevenLabs con la voz puesta en Configuración (por ejemplo tu voz '
+    + 'clonada). Las voces de Cartesia no se usan mientras esté así.');
+}
+
+async function guardarAjuste(cambios) {
+  const vista = estadoConfig();
+  try {
+    const r = await pedir(API.ajustes(), { method: 'PUT', cuerpo: cambios });
+    vista.ajustes = { ...(vista.ajustes || {}), ajustes: r.ajustes, costes: r.costes };
+    /* el deslizador de ritmo y el plan de un estilo nuevo dependen de esto:
+       se vuelven a pedir para que digan imágenes o dólares según toque */
+    if ('imagenes' in cambios && APP.light && APP.light.datos) {
+      APP.light.datos.imagenes_flow = r.ajustes.imagenes === 'flow';
+      cargarGaleriaLight(false);
+    }
+    toast('guardado');
+  } catch (e) {
+    toast(e.message, true);
+  }
+  repintarClaves();
+}
+
+function filaOpcion(puesta, nombre, que, alElegir) {
+  return h('button', {
+    clase: 'fila-opcion' + (puesta ? ' elegida' : ''),
+    disabled: puesta,
+    title: puesta ? 'es la que está puesta' : `cambiar a ${nombre}`,
+    onclick: alElegir,
+  },
+    h('span', { clase: 'nombre' }, nombre),
+    h('span', { clase: 'meta' }, que));
+}
+
+function seccionImagenes() {
+  const vista = estadoConfig();
+  const datos = vista.ajustes;
+  const motor = motorDeImagenes();
+  const flow = motor === 'flow';
+  const nombres = { openai: 'OpenAI', vertex: 'Google Vertex', flow: 'Google Flow' };
+  const caja = h('section', { clase: 'bloque-config' },
+    h('div', { clase: 'fila' },
+      h('h3', {}, 'Imágenes — quién las hace'),
+      h('span', { clase: 'crece' }),
+      datos ? pastillaEstado('ok', nombres[motor] || motor) : null));
+  if (!datos) {
+    caja.appendChild(h('div', { clase: 'cargando' }, 'leyendo los ajustes…'));
+    return caja;
+  }
+  caja.appendChild(filaOpcion(motor === 'openai', 'OpenAI',
+    'Se generan solas, una por plano, y se pagan por imagen (la calidad, más abajo).',
+    () => guardarAjuste({ imagenes: 'openai' })));
+  caja.appendChild(filaOpcion(motor === 'vertex', 'Google Vertex (Nano Banana)',
+    'Se generan solas con el mismo modelo que Flow, con las referencias de estilo '
+    + 'y de personajes adjuntas. ~0,04 $ por imagen, que salen de los créditos '
+    + 'de Google Cloud (la prueba gratuita da 300 $).',
+    () => guardarAjuste({ imagenes: 'vertex' })));
+  caja.appendChild(filaOpcion(flow, 'Google Flow, a mano',
+    'Las haces tú en Flow con la extensión de Chrome: el Estudio escribe los '
+    + 'prompts y recoge lo que descargas. No cuestan dinero, cuestan tu tiempo.',
+    () => guardarAjuste({ imagenes: 'flow' })));
+  if (motor === 'vertex') caja.appendChild(bloqueVertex());
+  if (flow) {
+    const defecto = datos.flow_descargas_por_defecto || '';
+    const campo = h('input', {
+      type: 'text', value: datos.ajustes.flow_descargas || '',
+      placeholder: defecto,
+    });
+    caja.appendChild(h('div', { clase: 'pista' },
+      'Dónde deja la extensión lo que descargas de Flow. Cada vídeo va en su '
+      + 'subcarpeta con su nombre; vacío es la de por defecto.'));
+    caja.appendChild(h('div', { clase: 'fila-clave' }, campo,
+      h('button', {
+        clase: 'mini',
+        onclick: () => guardarAjuste({ flow_descargas: campo.value.trim() }),
+      }, 'Guardar')));
+  }
+  caja.appendChild(h('div', { clase: 'meta' },
+    'Es el punto de partida de los vídeos NUEVOS: los que ya existen siguen '
+    + 'haciendo sus imágenes como las empezaron.'));
+  return caja;
+}
+
+/* GOOGLE VERTEX: la clave de una CUENTA DE SERVICIO, no una clave de API.
+   Vertex no acepta claves sueltas: pide el .json que da Google Cloud en IAM →
+   Cuentas de servicio → Claves. Se sube el fichero entero y no vuelve nunca al
+   navegador: lo que se enseña es su correo y el proyecto. */
+async function cargarVertex() {
+  const vista = estadoConfig();
+  try { vista.vertex = await pedir(API.vertex()); } catch (e) { vista.vertex = null; }
+  repintarClaves();
+}
+
+async function guardarVertex(cambios) {
+  const vista = estadoConfig();
+  try {
+    vista.vertex = await pedir(API.vertex(), { method: 'PUT', cuerpo: cambios });
+    vista.vertexPrueba = null;
+    toast('guardado');
+  } catch (e) {
+    toast(e.message, true);
+  }
+  repintarClaves();
+}
+
+async function probarVertex() {
+  const vista = estadoConfig();
+  vista.vertexPrueba = { estado: 'probando' };
+  repintarClaves();
+  try {
+    vista.vertexPrueba = await pedir(API.probarVertex(), { method: 'POST' });
+  } catch (e) {
+    vista.vertexPrueba = { estado: 'mal', mensaje: e.message };
+  }
+  repintarClaves();
+}
+
+function bloqueVertex() {
+  const vista = estadoConfig();
+  const vx = vista.vertex;
+  const caja = h('div', { clase: 'vertex-bloque' });
+  if (!vx) {
+    caja.appendChild(h('div', { clase: 'cargando' }, 'leyendo la cuenta de Google…'));
+    return caja;
+  }
+  caja.appendChild(h('div', { clase: 'fila' },
+    h('b', {}, 'Cuenta de Google Cloud'),
+    h('span', { clase: 'crece' }),
+    pastillaEstado(vx.listo ? 'ok' : 'error', vx.listo ? 'puesta' : 'sin poner')));
+  if (vx.cuenta) {
+    caja.appendChild(h('div', { clase: 'meta' },
+      `${vx.cuenta.correo} · proyecto ${vx.proyecto || vx.cuenta.proyecto}`));
+  }
+  const fichero = h('input', {
+    type: 'file', accept: '.json,application/json',
+    onchange: async ev => {
+      const f = ev.target.files && ev.target.files[0];
+      if (!f) return;
+      guardarVertex({ cuenta_json: await f.text() });
+      ev.target.value = '';
+    },
+  });
+  caja.appendChild(h('div', { clase: 'pista' },
+    (vx.cuenta ? 'Para cambiarla, sube otra' : 'Sube')
+    + ' la clave .json de una cuenta de servicio con el permiso «Vertex AI '
+    + 'User» (Google Cloud → IAM → Cuentas de servicio → Claves → Añadir clave '
+    + '→ JSON). En el proyecto tiene que estar activada la API de Vertex AI.'));
+  caja.appendChild(h('div', { clase: 'fila-clave' }, fichero));
+  const modelo = h('select', {},
+    ...Array.from(new Set([...(vx.modelos || []), vx.modelo])).map(m =>
+      h('option', { value: m, selected: m === vx.modelo }, m)));
+  const ubicacion = h('input', { type: 'text', value: vx.ubicacion || 'global',
+    placeholder: 'global' });
+  caja.appendChild(h('div', { clase: 'fila-clave' }, modelo, ubicacion,
+    h('button', {
+      clase: 'mini',
+      onclick: () => guardarVertex({ modelo: modelo.value, ubicacion: ubicacion.value.trim() }),
+    }, 'Guardar'),
+    vx.cuenta ? h('button', {
+      clase: 'mini fantasma',
+      disabled: (vista.vertexPrueba || {}).estado === 'probando',
+      onclick: () => probarVertex(),
+    }, (vista.vertexPrueba || {}).estado === 'probando' ? 'probando…' : 'Probar') : null));
+  const prueba = vista.vertexPrueba;
+  if (prueba && prueba.estado !== 'probando') {
+    caja.appendChild(h('div', { clase: 'prueba-clave' },
+      h('div', { clase: 'fila' },
+        h('b', {}, 'Google Vertex'),
+        h('span', { clase: 'crece' }),
+        pastillaEstado(prueba.estado === 'ok' ? 'ok' : 'error',
+          prueba.estado === 'ok' ? 'funciona' : 'falla')),
+      h('div', { clase: 'meta' }, prueba.mensaje || '')));
+  }
+  caja.appendChild(h('div', { clase: 'meta' },
+    'Probar no genera ninguna imagen: no gasta créditos.'));
+  return caja;
+}
+
+async function cargarVozProveedor() {
+  const vista = estadoConfig();
+  try {
+    vista.voz = await pedir(API.vozProveedor());
+  } catch (e) {
+    vista.voz = null;
+  }
+  repintarClaves();
+}
+
+async function guardarVozProveedor(cambios) {
+  const vista = estadoConfig();
+  try {
+    vista.voz = await pedir(API.vozProveedor(), { method: 'PUT', cuerpo: cambios });
+    vista.vozPrueba = null;
+    if (APP.light && APP.light.datos) APP.light.datos.voz_proveedor = vista.voz.proveedor;
+    toast('guardado');
+  } catch (e) {
+    toast(e.message, true);
+  }
+  repintarClaves();
+}
+
+async function probarVozProveedor() {
+  const vista = estadoConfig();
+  vista.vozPrueba = { estado: 'probando' };
+  repintarClaves();
+  try {
+    vista.vozPrueba = await pedir(API.probarVozProveedor(), { method: 'POST' });
+  } catch (e) {
+    vista.vozPrueba = { estado: 'mal', mensaje: e.message };
+  }
+  repintarClaves();
+}
+
+function seccionVoz() {
+  const vista = estadoConfig();
+  const voz = vista.voz;
+  const eleven = vozConElevenLabs();
+  const caja = h('section', { clase: 'bloque-config' },
+    h('div', { clase: 'fila' },
+      h('h3', {}, 'Voz — quién locuta'),
+      h('span', { clase: 'crece' }),
+      voz ? pastillaEstado('ok', eleven ? 'ElevenLabs' : 'Cartesia') : null));
+  if (!voz) {
+    caja.appendChild(h('div', { clase: 'cargando' }, 'leyendo la voz…'));
+    return caja;
+  }
+  const el = voz.elevenlabs || {};
+  caja.appendChild(filaOpcion(!eleven, 'Cartesia',
+    'Sus voces de catálogo, o una clonada en Cartesia. La clave, más abajo.',
+    () => guardarVozProveedor({ proveedor: 'cartesia' })));
+  caja.appendChild(filaOpcion(eleven, 'ElevenLabs',
+    'Una voz de tu cuenta de ElevenLabs, por ejemplo tu voz clonada. Gasta los '
+    + 'créditos de tu plan: uno por cada carácter del guion.',
+    () => guardarVozProveedor({ proveedor: 'elevenlabs' })));
+
+  const clave = h('input', {
+    type: 'password', placeholder: el.tiene_clave ? `puesta (${el.clave})` : 'sk_…',
+  });
+  const vozId = h('input', {
+    type: 'text', value: el.voz_id || '', placeholder: 'el id de la voz',
+  });
+  const modelo = h('select', {},
+    ...(el.modelos || []).map(m => h('option', { value: m, selected: m === el.modelo }, m)));
+  caja.appendChild(h('div', { clase: 'pista' },
+    'ElevenLabs: la clave (Developers → API keys) y el id de la voz (Voices → tu '
+    + 'voz → «ID»). Una clave con permisos limitados vale si deja sintetizar.'));
+  caja.appendChild(h('div', { clase: 'fila-clave' }, clave));
+  caja.appendChild(h('div', { clase: 'fila-clave' }, vozId, modelo,
+    h('button', {
+      clase: 'mini',
+      onclick: () => guardarVozProveedor({ elevenlabs: {
+        clave: clave.value.trim(), voz_id: vozId.value.trim(), modelo: modelo.value } }),
+    }, 'Guardar'),
+    el.tiene_clave ? h('button', {
+      clase: 'mini fantasma',
+      disabled: (vista.vozPrueba || {}).estado === 'probando',
+      onclick: () => probarVozProveedor(),
+    }, (vista.vozPrueba || {}).estado === 'probando' ? 'probando…' : 'Probar') : null));
+  const prueba = vista.vozPrueba;
+  if (prueba && prueba.estado !== 'probando') {
+    caja.appendChild(h('div', { clase: 'prueba-clave' },
+      h('div', { clase: 'fila' },
+        h('b', {}, 'ElevenLabs'),
+        h('span', { clase: 'crece' }),
+        pastillaEstado(prueba.estado === 'ok' ? 'ok' : 'error',
+          prueba.estado === 'ok' ? 'funciona' : 'falla')),
+      h('div', { clase: 'meta' }, prueba.mensaje || '')));
+  }
+  caja.appendChild(h('div', { clase: 'meta' },
+    'Cambiarlo no toca ninguna voz ya grabada: vale para la próxima toma.'));
+  return caja;
+}
+
 
 /* Las cuentas del CLI: una LISTA ORDENADA, y se entra desde aquí.
  *
@@ -2479,12 +3088,25 @@ function seccionCLI() {
   const cli = vista.cli;
   const cuentas = (cli && cli.cuentas) || [];
   const dentro = cuentas.filter(c => c.sesion && c.sesion.conectada).length;
+  /* LA SESIÓN POR DEFECTO TAMBIÉN CUENTA. Sin ninguna cuenta de aquí con
+     sesión, el motor y el asistente hablan con la del propio CLI; esto decía
+     «sin sesión» mientras el guion se escribía con ella. */
+  const defecto = (cli && cli.por_defecto && cli.por_defecto.sesion) || null;
+  const porDefecto = !dentro && defecto && defecto.conectada;
   const caja = h('section', { clase: 'bloque-config' },
     h('div', { clase: 'fila' },
       h('h3', {}, 'Claude CLI — guion, catálogo, rótulos…'),
       h('span', { clase: 'crece' }),
-      pastillaEstado(dentro ? 'ok' : 'error',
-        !cli ? 'mirando…' : (dentro ? `${dentro} con sesión` : 'sin sesión'))),
+      pastillaEstado(dentro || porDefecto ? 'ok' : 'error',
+        !cli ? 'mirando…'
+          : (dentro ? `${dentro} con sesión`
+            : (porDefecto ? `sesión del CLI · ${defecto.correo || 'conectada'}`
+              : 'sin sesión')))),
+    porDefecto ? h('div', { clase: 'meta' },
+      'Se usa la sesión con la que está abierto el CLI de Claude en este equipo'
+      + (defecto.plan ? ` (plan ${defecto.plan})` : '')
+      + '. Las cuentas de abajo son opcionales: sirven de respaldo si se agota '
+      + 'el cupo, y solo cuentan cuando se entra con ellas.') : null,
     h('div', { clase: 'pista' },
       'Aquí no va una clave: va una CUENTA. Se gasta la suscripción con '
       + 'la que el CLI esté logueado, y eso no se puede cambiar con una clave de '
@@ -2651,7 +3273,9 @@ async function probarCuentaCLI(cid) {
    que no cuestan dinero. Es el mismo bloque en Configuración y en la última
    tarjeta de la guía. */
 const NOMBRES_PROVEEDOR = {
-  openai: 'OpenAI — imágenes', cartesia: 'Cartesia — voz', jamendo: 'Jamendo — música',
+  openai: 'OpenAI — imágenes', cartesia: 'Cartesia — voz',
+  elevenlabs: 'ElevenLabs — voz', vertex: 'Google Vertex — imágenes',
+  jamendo: 'Jamendo — música',
   freesound: 'FreeSound — efectos', claude: 'Claude',
 };
 
@@ -3916,6 +4540,7 @@ const RENDIMIENTO = { paso: null, panorama: null };
    salian en crudo ('capturas_agente') junto a los demas ya con su nombre. */
 const NOMBRES_FUERA_DEL_GRAFO = {
   capturas_agente: 'Agente de capturas',
+  publicar: 'Para publicar',
   catalogo_visual: 'Catálogo visual',
   conservacion: 'Qué se puede conservar',
   guia_estilo: 'Guía de estilo',
@@ -4601,6 +5226,19 @@ function arrancar() {
   cargarCuenta();
   montarAsistente();
   $('#btn-cerrar-config').addEventListener('click', () => conmutarConfig(false));
+  const btnNotif = $('#btn-notificaciones');
+  if (btnNotif) btnNotif.addEventListener('click', () => alternarNotificaciones());
+  const btnCerrarNotif = $('#btn-cerrar-notificaciones');
+  if (btnCerrarNotif) btnCerrarNotif.addEventListener('click', () => alternarNotificaciones(false));
+  const btnLimpiarNotif = $('#btn-limpiar-notificaciones');
+  if (btnLimpiarNotif) btnLimpiarNotif.addEventListener('click', () => {
+    HISTORIAL_NOTIFICACIONES.length = 0;
+    notificacionesNoLeidas = 0;
+    actualizarBadgeNotificaciones();
+    pintarNotificaciones();
+  });
+  const toastElem = $('#toast');
+  if (toastElem) toastElem.addEventListener('click', () => alternarNotificaciones(true));
   // El catalogo de recetas se pide una vez al arrancar: de el salen la barra de
   // cada pestana y el ajuste RECORDADO de cada fase del CLI, asi que sin el los
   // desplegables saldrian con el defecto de fabrica y no con lo que hay puesto.
@@ -4870,8 +5508,13 @@ function resumenRitmo(ficha) {
   // toFixed(1) y no el número pelado: «~2 s» y «~2,8 s» uno debajo del otro
   // saltan de ancho al mover el deslizador, y lo que se lee es una cifra que
   // cambia de forma además de de valor.
-  return `${ficha.nombre} · plano medio ~${ficha.media_s.toFixed(1).replace('.', ',')} s`
-    + ` · ~${ficha.usd_por_minuto.toFixed(2).replace('.', ',')} $/min`;
+  const plano = `${ficha.nombre} · plano medio ~${ficha.media_s.toFixed(1).replace('.', ',')} s`;
+  /* CON FLOW LO QUE CUESTA ES TRABAJO, NO DINERO: cada plano es una imagen que
+     haces tú a mano, así que se dice cuántas por minuto de vídeo. */
+  if ((APP.light.datos || {}).imagenes_flow && ficha.imagenes_por_minuto) {
+    return `${plano} · ~${String(Math.round(ficha.imagenes_por_minuto))} imágenes/min a mano en Flow`;
+  }
+  return `${plano} · ~${ficha.usd_por_minuto.toFixed(2).replace('.', ',')} $/min`;
 }
 
 /* El deslizador. Cinco posiciones y una sola línea debajo: sin números de
@@ -5682,7 +6325,7 @@ async function contarLaTandaQueMurio(pid) {
       `${API.trabajosVivos()}?proyecto=${encodeURIComponent(pid)}`);
     const generaciones = (datos.trabajos || [])
       .filter(t => String(t.nombre || '').startsWith('generar:'));
-    const ultimo = generaciones[generaciones.length - 1];
+    const ultimo = generaciones[0];
     if (!ultimo || ultimo.estado !== 'error') return;
     mostrarError(CLAVE_VIDEO_LIGHT, new Error(
       `la última generación se cortó: ${ultimo.error || 'sin motivo'}`));
@@ -6445,7 +7088,7 @@ async function lanzarTandaLight(tanda, modo) {
         // LA TANDA DE VIDEO YA NO ACABA EN EL MP4, acaba en el
         // previsualizador: es la parada nueva y es lo que hay que mirar antes
         // de gastar el render (ver TANDAS_LIGHT en app.py).
-        if (tanda === 'video') { PREVIA.ficha = null; v.vista = 'previa'; }
+        if (tanda === 'video') { PREVIA.ficha = null; v.vista = 'previa'; v.flowSucio = true; }
         else if (tanda === 'render') v.vista = 'video';
         // regenerado desde el encargo, lo que toca mirar es el guion nuevo;
         // desde cualquier otra pantalla no se mueve a nadie
@@ -7354,18 +7997,33 @@ const PREVIA = {
   guardando: false,
   borrador: {},       // id de escena -> lo escrito y sin enviar
   editando: '',       // id de la nota que se está corrigiendo, si hay alguna
+  filtroNotasPlano: 'este_plano', // 'este_plano' (por defecto) o 'todos'
+  mostrarResueltas: false,        // ocultar notas aplicadas por defecto
+  plegadoNotas: false,            // replegar lista de notas
 };
 
-async function cargarPreviaLight() {
+async function cargarPreviaLight(conservarEscenaId = null) {
   const v = videoAbierto();
   if (!v.pid || PREVIA.cargando) return;
+  const escenaActualId = conservarEscenaId || ((PREVIA.ficha && PREVIA.ficha.escenas && PREVIA.ficha.escenas[PREVIA.i]) ? PREVIA.ficha.escenas[PREVIA.i].id : null);
   PREVIA.cargando = true;
   PREVIA.error = '';
   repintarVideo();
   try {
     PREVIA.ficha = await pedir(`${API.proyecto(v.pid)}/previsualizacion`);
-    PREVIA.i = 0;
-    PREVIA.t = 0;
+    const escenas = (PREVIA.ficha || {}).escenas || [];
+    if (escenaActualId) {
+      const idx = escenas.findIndex(e => e.id === escenaActualId);
+      if (idx >= 0) {
+        PREVIA.i = idx;
+      } else {
+        PREVIA.i = Math.max(0, Math.min(PREVIA.i || 0, Math.max(0, escenas.length - 1)));
+      }
+    } else {
+      PREVIA.i = Math.max(0, Math.min(PREVIA.i || 0, Math.max(0, escenas.length - 1)));
+    }
+    const escenaSel = escenas[PREVIA.i];
+    PREVIA.t = escenaSel ? escenaSel.t_in : 0;
     await refrescarNotasPrevia();
     prebufferPrevia();
   } catch (err) {
@@ -7643,13 +8301,36 @@ function reproducirTodoPrevia() {
     .catch(() => { PREVIA.sonando = false; });
 }
 
-/* ------------------------------------------------------------ moverse */
+function escenasConVideoValido(escenas) {
+  const conMp4 = (escenas || []).filter(e => !!e.video);
+  return conMp4.length ? conMp4 : (escenas || []).filter(e => e.flow_num || e.es_video);
+}
 
 function irAEscenaPrevia(salto) {
   const escenas = (PREVIA.ficha || {}).escenas || [];
-  const j = Math.max(0, Math.min(escenas.length - 1, PREVIA.i + salto));
-  if (j === PREVIA.i) return;
-  PREVIA.i = j;
+  if (!escenas.length) return;
+  if (PREVIA.filtroVideos) {
+    const validas = escenasConVideoValido(escenas);
+    const indicesConVideo = escenas
+      .map((e, idx) => (validas.includes(e) ? idx : -1))
+      .filter(idx => idx >= 0);
+    if (!indicesConVideo.length) return;
+    const posActual = indicesConVideo.indexOf(PREVIA.i);
+    let nuevaPos;
+    if (posActual === -1) {
+      nuevaPos = salto > 0 ? indicesConVideo.findIndex(idx => idx > PREVIA.i) : -1;
+      if (nuevaPos === -1) nuevaPos = salto > 0 ? 0 : indicesConVideo.length - 1;
+    } else {
+      nuevaPos = Math.max(0, Math.min(indicesConVideo.length - 1, posActual + salto));
+    }
+    const j = indicesConVideo[nuevaPos];
+    if (j === PREVIA.i) return;
+    PREVIA.i = j;
+  } else {
+    const j = Math.max(0, Math.min(escenas.length - 1, PREVIA.i + salto));
+    if (j === PREVIA.i) return;
+    PREVIA.i = j;
+  }
   prebufferPrevia();
   repintarVideo();
   sonarEscenaPrevia();
@@ -7750,19 +8431,299 @@ function irAPrimeraObsoleta() {
   if (i >= 0) { PREVIA.i = i; PREVIA.t = 0; repintarVideo(); }
 }
 
+function rejillaDeEscenas(escenas) {
+  const v = videoAbierto();
+  const rejilla = h('div', { clase: 'rejilla-escenas-previa' });
+  const validas = escenasConVideoValido(escenas);
+  const elementos = PREVIA.filtroVideos
+    ? escenas.map((esc, idx) => ({ esc, idx })).filter(item => validas.includes(item.esc))
+    : escenas.map((esc, idx) => ({ esc, idx }));
+
+  if (PREVIA.filtroVideos && !elementos.length) {
+    return h('div', { style: 'padding: 40px; text-align: center; color: var(--tenue);' },
+      h('div', { style: 'font-size: 28px; margin-bottom: 8px;' }, '🎬'),
+      h('div', {}, 'No hay escenas con vídeo disponible para filtrar.'),
+      h('button', {
+        clase: 'mini primario', style: 'margin-top: 12px;',
+        onclick: () => { PREVIA.filtroVideos = false; repintarVideo(); }
+      }, 'Ver todas las imágenes')
+    );
+  }
+
+  elementos.forEach(({ esc, idx }) => {
+    const tarjeta = h('div', {
+      clase: idx === PREVIA.i ? 'tarjeta-miniatura-escena activa' : 'tarjeta-miniatura-escena',
+      title: `${esc.id}: ${esc.narracion || ''}\nPulsa para ver en detalle y editar`,
+      onclick: () => {
+        PREVIA.i = idx;
+        PREVIA.t = 0;
+        PREVIA.vistaRejilla = false;
+        prebufferPrevia();
+        repintarVideo();
+      }
+    });
+    if (esc.video) {
+      const vid = h('video', {
+        src: esc.video,
+        autoplay: true,
+        muted: true,
+        loop: true,
+        playsinline: true,
+        preload: 'metadata',
+        poster: esc.imagen ? `${API.archivo(v.pid, esc.imagen)}?mini=400` : '',
+      });
+      tarjeta.addEventListener('mouseenter', () => { vid.play().catch(() => {}); });
+      vid.onerror = () => {
+        if (esc.imagen) {
+          vid.replaceWith(h('img', {
+            src: `${API.archivo(v.pid, esc.imagen)}?mini=400`,
+            alt: esc.id,
+            loading: 'lazy'
+          }));
+        }
+      };
+      tarjeta.appendChild(vid);
+      tarjeta.appendChild(h('div', {
+        style: 'position: absolute; bottom: 26px; right: 6px; background: rgba(0,0,0,0.7); color: #00e5ff; border-radius: 50%; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; font-size: 10px; pointer-events: none; border: 1px solid rgba(0,229,255,0.4);'
+      }, '▶'));
+    } else if (esc.imagen) {
+      tarjeta.appendChild(h('img', {
+        src: `${API.archivo(v.pid, esc.imagen)}?mini=400`,
+        alt: esc.id,
+        loading: 'lazy',
+        onerror: ev => {
+          ev.target.replaceWith(h('div', {
+            style: 'aspect-ratio: 16/9; background: #222; display: flex; align-items: center; justify-content: center; color: var(--tenue); font-size: 11px;'
+          }, 'Sin imagen'));
+        }
+      }));
+    } else {
+      tarjeta.appendChild(h('div', {
+        style: 'aspect-ratio: 16/9; background: #222; display: flex; align-items: center; justify-content: center; color: var(--tenue); font-size: 11px;'
+      }, 'Sin imagen'));
+    }
+    tarjeta.appendChild(h('div', { clase: 'pie-mini' },
+      h('span', { clase: 'id-mini' }, esc.id),
+      h('span', { clase: 'dur-mini' }, `${esc.duracion.toFixed(1)}s`)
+    ));
+    if (esc.video || esc.flow_num) {
+      tarjeta.appendChild(h('div', {
+        style: 'position: absolute; top: 4px; left: 4px; background: rgba(0,0,0,0.85); color: #00e5ff; border: 1px solid #00e5ff; font-size: 10px; font-weight: 700; padding: 2px 5px; border-radius: 3px; z-index: 2;'
+      }, esc.video ? (esc.flow_num ? `🎬 #${esc.flow_num}` : '🎬 VÍDEO') : `⏳ #${esc.flow_num}`));
+    }
+    rejilla.appendChild(tarjeta);
+  });
+  return rejilla;
+}
+
+function tarjetaFlowVideosLight() {
+  const v = videoAbierto();
+  const escenas = (PREVIA.ficha || {}).escenas || [];
+  const escenasFlow = escenas.filter(e => e.flow_num || e.video || e.es_video);
+  if (!escenasFlow.length) return null;
+
+  const listos = escenasFlow.filter(e => !!e.video).length;
+  const total = escenasFlow.length;
+
+  const tarjeta = h('div', {
+    clase: 'tarjeta-flow-resumen',
+    style: 'margin-bottom: 16px; padding: 14px 18px; background: rgba(0, 229, 255, 0.04); border: 1px solid rgba(0, 229, 255, 0.25); border-radius: 8px;'
+  });
+
+  const cab = h('div', { style: 'display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;' },
+    h('div', { style: 'display: flex; align-items: center; gap: 10px;' },
+      h('span', { style: 'font-size: 20px;' }, '🎬'),
+      h('div', {},
+        h('div', { style: 'font-weight: 700; color: #00e5ff; font-size: 14px;' },
+          `Clips animados Google Flow (${total} escenas)`),
+        h('div', { style: 'font-size: 12px; color: var(--tenue); margin-top: 2px;' },
+          `${listos} de ${total} clips listos · Los clips existentes ahorran llamadas y saldo en la generación de imágenes`)
+      )
+    ),
+    h('div', { style: 'display: flex; gap: 8px; align-items: center; flex-wrap: wrap;' },
+      h('button', {
+        clase: PREVIA.filtroVideos ? 'mini primario' : 'mini fantasma',
+        style: 'border: 1px solid #00e5ff;',
+        title: PREVIA.filtroVideos ? 'Mostrar todas las escenas' : 'Ver únicamente las escenas con vídeo en la galería',
+        onclick: () => {
+          PREVIA.filtroVideos = !PREVIA.filtroVideos;
+          if (PREVIA.filtroVideos) {
+            const validas = escenasConVideoValido(escenas);
+            const primero = escenas.findIndex(e => validas.includes(e));
+            if (primero >= 0) { PREVIA.i = primero; PREVIA.t = 0; }
+          }
+          prebufferPrevia();
+          repintarVideo();
+        }
+      }, PREVIA.filtroVideos ? '👁️ Viendo solo vídeos' : `🔍 Ver solo vídeos (${listos || total})`),
+      h('button', {
+        clase: 'mini primario',
+        onclick: async () => {
+          try {
+            const data = await pedir(API.flowVideos(v.pid));
+            mostrarModalPromptsFlow(data);
+          } catch (e) {
+            toast(`Error al leer clips: ${e.message}`, true);
+          }
+        }
+      }, '📋 Ver y copiar todos los prompts de Flow')
+    )
+  );
+
+  tarjeta.appendChild(cab);
+  return tarjeta;
+}
+
+function mostrarModalPromptsFlow(data) {
+  const clips = (data && data.clips) || [];
+  if (!clips.length) {
+    toast('No hay clips de Flow detectados en el guion de este proyecto');
+    return;
+  }
+
+  const contenido = h('div', { style: 'max-height: 70vh; overflow-y: auto; padding: 10px;' });
+  contenido.appendChild(h('p', { style: 'font-size: 13px; color: var(--tenue); line-height: 1.5; margin-bottom: 16px;' },
+    'Estos son los prompts en inglés para Google Flow Video (8s) extraídos directamente de tu guion. Puedes copiarlos uno a uno o generar los vídeos antes de producir las imágenes:'));
+
+  clips.forEach(clip => {
+    const card = h('div', {
+      style: 'background: var(--hueco); border: 1px solid var(--linea); border-radius: 6px; padding: 12px; margin-bottom: 12px;'
+    },
+      h('div', { style: 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;' },
+        h('b', { style: 'color: #00e5ff; font-size: 13px;' },
+          `FLOW #${clip.num}: ${clip.titulo || ''}` + (clip.escena_id ? ` (Plano ${clip.escena_id})` : '')),
+        h('span', {
+          style: 'font-size: 11px; padding: 2px 6px; border-radius: 3px; background: ' + (clip.presente ? 'rgba(0,230,118,0.15); color: #00e676;' : 'rgba(255,145,0,0.15); color: #ff9100;')
+        }, clip.presente ? '✓ Presente' : '⏳ Pendiente')
+      ),
+      h('div', {
+        style: 'font-family: monospace; font-size: 11px; color: var(--texto); background: rgba(0,0,0,0.3); padding: 8px; border-radius: 4px; margin-bottom: 8px; white-space: pre-wrap; line-height: 1.4;'
+      }, clip.prompt || '(sin prompt en inglés específico)'),
+      h('div', { style: 'display: flex; justify-content: space-between; align-items: center;' },
+        h('button', {
+          clase: 'mini',
+          onclick: () => {
+            navigator.clipboard.writeText(clip.prompt || '').then(() => toast(`¡Prompt FLOW #${clip.num} copiado!`));
+          }
+        }, '📋 Copiar prompt'),
+        h('span', { style: 'font-size: 11px; color: var(--tenue);' },
+          `Archivo: ${clip.archivo_recomendado || `flow_${clip.num}.mp4`}`)
+      )
+    );
+    contenido.appendChild(card);
+  });
+
+  const modal = h('div', {
+    clase: 'modal-overlay',
+    style: 'position: fixed; inset: 0; background: rgba(0,0,0,0.75); display: flex; align-items: center; justify-content: center; z-index: 9999;'
+  },
+    h('div', {
+      style: 'background: var(--fondo); border: 1px solid var(--linea); border-radius: 10px; width: 90%; max-width: 650px; padding: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.8);'
+    },
+      h('div', { style: 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;' },
+        h('h3', { style: 'margin: 0; color: #00e5ff;' }, '🎬 Prompts de Google Flow Video'),
+        h('button', {
+          clase: 'mini fantasma',
+          onclick: () => modal.remove()
+        }, '✕')
+      ),
+      contenido,
+      h('div', { style: 'display: flex; justify-content: flex-end; margin-top: 14px;' },
+        h('button', {
+          clase: 'primario mini',
+          onclick: () => modal.remove()
+        }, 'Cerrar')
+      )
+    )
+  );
+
+  document.body.appendChild(modal);
+}
+
 function vistaPreviaLight() {
   const v = videoAbierto();
   const caja = h('div', { clase: 'light-previa' });
   const escenas = (PREVIA.ficha || {}).escenas || [];
   const e = escenaPrevia();
 
+  const escenasConVideo = escenasConVideoValido(escenas);
+  const indicesConVideo = escenasConVideo.map(esc => escenas.indexOf(esc));
+
+  const selectorEscenas = escenas.length ? h('select', {
+    clase: 'mini selector-escenas-previa',
+    title: 'Saltar directamente a cualquier escena',
+    onchange: ev => {
+      const idx = parseInt(ev.target.value, 10);
+      if (!isNaN(idx)) {
+        PREVIA.i = idx;
+        PREVIA.t = 0;
+        prebufferPrevia();
+        repintarVideo();
+      }
+    }
+  }, escenas.map((esc, idx) => {
+    if (PREVIA.filtroVideos && !escenasConVideo.includes(esc)) {
+      return null;
+    }
+    const tieneVid = !!esc.video;
+    const prefijo = tieneVid ? '🎬 ' : (esc.flow_num ? '⏳ ' : '');
+    return h('option', {
+      value: idx,
+      selected: idx === PREVIA.i
+    }, `${prefijo}${esc.id} (${esc.duracion.toFixed(1)}s)` + (esc.narracion ? ` - ${esc.narracion.slice(0, 30)}…` : ''));
+  }).filter(Boolean)) : null;
+
+  const btnFiltroVideo = escenasConVideo.length ? h('button', {
+    clase: PREVIA.filtroVideos ? 'mini primario' : 'mini fantasma',
+    style: PREVIA.filtroVideos ? 'border: 1px solid #00e5ff; color: #00e5ff;' : '',
+    title: PREVIA.filtroVideos ? 'Mostrar todas las escenas' : `Mostrar solo los ${escenasConVideo.length} vídeos disponibles`,
+    onclick: () => {
+      PREVIA.filtroVideos = !PREVIA.filtroVideos;
+      if (PREVIA.filtroVideos) {
+        const actual = escenas[PREVIA.i];
+        if (!actual || !escenasConVideo.includes(actual)) {
+          const primero = escenas.findIndex(esc => escenasConVideo.includes(esc));
+          if (primero >= 0) { PREVIA.i = primero; PREVIA.t = 0; }
+        }
+      }
+      prebufferPrevia();
+      repintarVideo();
+    }
+  }, PREVIA.filtroVideos ? `🎬 Solo vídeos (${escenasConVideo.length})` : `🎬 Filtrar vídeos (${escenasConVideo.length})`) : null;
+
+  const btnModoVista = escenas.length ? h('button', {
+    clase: PREVIA.vistaRejilla ? 'mini primario' : 'mini fantasma',
+    title: PREVIA.vistaRejilla ? 'Volver a ver escena por escena' : 'Ver todos los planos en cuadrícula para encontrar uno rápido',
+    onclick: () => {
+      PREVIA.vistaRejilla = !PREVIA.vistaRejilla;
+      repintarVideo();
+    }
+  }, PREVIA.vistaRejilla ? '🖼️ Una a una' : '⊞ Ver todas') : null;
+
+  const textoMeta = escenas.length
+    ? (PREVIA.filtroVideos
+      ? `vídeo ${Math.max(1, indicesConVideo.indexOf(PREVIA.i) + 1)} de ${escenasConVideo.length}`
+      : `escena ${PREVIA.i + 1} de ${escenas.length}`)
+    : '';
+
   caja.appendChild(h('div', { clase: 'light-cab' },
-    h('h2', {}, 'Las imágenes, una a una'),
-    h('span', { clase: 'meta' },
-      escenas.length ? `escena ${PREVIA.i + 1} de ${escenas.length}` : ''),
+    h('h2', {}, PREVIA.vistaRejilla ? (PREVIA.filtroVideos ? 'Vídeos animados en cuadrícula' : 'Todas las imágenes') : 'Las imágenes, una a una'),
+    h('span', { clase: 'meta' }, textoMeta),
+    selectorEscenas,
+    btnFiltroVideo,
+    btnModoVista,
     obsoletasEnLaCabecera(escenas),
     h('span', { clase: 'crece' }),
     costeLight()));
+
+  /* Clips animados Google Flow */
+  const flowVideos = tarjetaFlowVideosLight();
+  if (flowVideos) caja.appendChild(flowVideos);
+
+  /* CON FLOW (imágenes), LO PRIMERO ES POR DÓNDE SE SIGUE: si faltan imágenes, la tanda
+     se ha parado aquí esperándolas (ver `tarjetaFlowLight`). */
+  const flow = tarjetaFlowLight();
+  if (flow) caja.appendChild(flow);
 
   if (PREVIA.error) { caja.appendChild(cajaError(PREVIA.error)); return caja; }
   if (!PREVIA.ficha) {
@@ -7777,6 +8738,11 @@ function vistaPreviaLight() {
   if (!e) {
     caja.appendChild(h('div', { clase: 'vacio' },
       'no hay ninguna escena que mirar todavía'));
+    return caja;
+  }
+
+  if (PREVIA.vistaRejilla) {
+    caja.appendChild(rejillaDeEscenas(escenas));
     return caja;
   }
 
@@ -7799,14 +8765,71 @@ function vistaPreviaLight() {
      revisiones distintas en la misma pantalla y hacia dudar de si una nota era
      del dibujo o del texto de encima. */
   marco.classList.add(formatoDelVideo());
+  marco.style.position = 'relative';
   const fondo = e.imagen;
-  if (fondo) {
+  const pintarHuecoSinImagen = motivo => {
+    vaciar(marco);
+    const cajaVacia = h('div', {
+      clase: 'previa-sin-imagen',
+      style: 'display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; width: 100%; min-height: 260px; background: rgba(0,0,0,0.5); color: var(--tenue); padding: 24px; text-align: center; border-radius: 8px;'
+    },
+      h('div', { style: 'font-size: 34px; margin-bottom: 8px;' }, '🖼️'),
+      h('div', { style: 'font-weight: 700; color: var(--texto); font-size: 16px; margin-bottom: 6px;' },
+        `Plano ${e.id} sin imagen generada`),
+      h('div', { clase: 'meta', style: 'margin-bottom: 16px; max-width: 420px; font-size: 13px; line-height: 1.4;' },
+        motivo || 'Este plano aún no tiene imagen o su generación anterior se interrumpió.'),
+      h('button', {
+        clase: 'primario',
+        style: 'font-size: 13px; padding: 7px 16px;',
+        onclick: ev => {
+          ev.stopPropagation();
+          encolarImagen(e.id, PREVIA.borrador[e.id] || '');
+        }
+      }, '⟳ Generar imagen de este plano')
+    );
+    marco.appendChild(cajaVacia);
+  };
+
+  if (e.video) {
+    const vidEl = h('video', {
+      src: e.video,
+      controls: true,
+      autoplay: true,
+      loop: true,
+      muted: true,
+      playsinline: true,
+      preload: 'auto',
+      style: 'width: 100%; height: 100%; object-fit: contain; background: #000; border-radius: 6px; display: block;'
+    });
+    vidEl.onerror = () => {
+      console.warn('Error cargando clip de vídeo:', e.id, e.video);
+      pintarHuecoSinImagen('No se pudo reproducir el archivo de vídeo asociado.');
+    };
+    marco.appendChild(vidEl);
+  } else if (fondo) {
     marco.appendChild(h('img', {
       // en miniatura ancha: se ve igual en pantalla y entra en la caché que
       // ya ha llenado el prebuffer, así que la flecha derecha es instantánea
       src: `${API.archivo(v.pid, fondo)}?mini=1024`,
       alt: e.id,
+      onerror: () => pintarHuecoSinImagen('No se pudo cargar la imagen desde el servidor.')
     }));
+  } else {
+    pintarHuecoSinImagen();
+  }
+
+  if (e.es_video || e.flow_num || e.video) {
+    const badgeText = e.flow_num ? `🎬 FLOW #${e.flow_num}` : '🎬 VÍDEO ANIMADO';
+    const badge = h('div', {
+      clase: 'badge-flow-video',
+      style: 'position: absolute; top: 12px; left: 12px; background: rgba(0,0,0,0.85); color: #00e5ff; border: 1px solid #00e5ff; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 12px; z-index: 5; display: flex; align-items: center; gap: 6px; pointer-events: none;'
+    }, badgeText);
+    if (e.cuarta_pared) {
+      badge.appendChild(h('span', {
+        style: 'color: #ff5252; background: rgba(255,82,82,0.15); padding: 2px 6px; border-radius: 3px; font-size: 11px;'
+      }, 'CUARTA PARED'));
+    }
+    marco.appendChild(badge);
   }
   /* NI SUBTITULO NI SELLO DE CARTELA: aqui se mira el DIBUJO y nada mas.
      Los dos se revisan -- y se corrigen -- en la pantalla del video, que es
@@ -7822,9 +8845,13 @@ function vistaPreviaLight() {
      Anclada al fondo tiene que ser el ultimo elemento del flujo o taparia lo
      que venga detras -- el cuadro de feedback y el boton de aplicar --, que es
      justo lo que se le pide que no haga. */
+  const posVideoActual = PREVIA.filtroVideos ? indicesConVideo.indexOf(PREVIA.i) : -1;
+  const deshabilitarAnt = PREVIA.filtroVideos ? (posVideoActual <= 0) : (PREVIA.i === 0);
+  const deshabilitarSig = PREVIA.filtroVideos ? (posVideoActual >= indicesConVideo.length - 1 || posVideoActual === -1) : (PREVIA.i >= escenas.length - 1);
+
   const mandos = h('div', { clase: 'previa-mandos' },
     h('button', {
-      clase: 'mini', disabled: PREVIA.i === 0,
+      clase: 'mini', disabled: deshabilitarAnt,
       onclick: () => irAEscenaPrevia(-1), title: 'La anterior (←)',
     }, '‹'),
     h('button', {
@@ -7847,7 +8874,7 @@ function vistaPreviaLight() {
       + (e.bloque ? ` · ${e.bloque}` : '')),
     h('span', { clase: 'crece' }),
     h('button', {
-      clase: 'primario', disabled: PREVIA.i >= escenas.length - 1,
+      clase: 'primario', disabled: deshabilitarSig,
       onclick: () => irAEscenaPrevia(1), title: 'La siguiente (→)',
     }, 'Siguiente ›'));
 
@@ -7868,13 +8895,8 @@ function vistaPreviaLight() {
   if (e.obsoleta) caja.appendChild(avisoImagenObsoleta(e));
   caja.appendChild(cuadroFeedbackEscena(e));
 
-  /* LA LISTA ENTERA DE NOTAS, LA MISMA QUE EN EL VIDEO.
-     Antes aqui solo salian las de la escena que estabas mirando, asi que para
-     saber que llevabas apuntado en las otras doscientas habia que pasarlas una
-     a una o irse al video. Es el MISMO componente --`listaDeNotas`--, no una
-     copia: una segunda lista se separa de la primera en cuanto alguien toque
-     una de las dos. Pulsando el plano se salta a esa diapositiva. */
-  if (notasDeAhora().length) caja.appendChild(listaDeNotas());
+  const secNotas = seccionNotasPrevia(e);
+  if (secNotas) caja.appendChild(secNotas);
 
   /* APLICAR TAMBIEN SE PUEDE DESDE AQUI, y no solo con el video ya montado.
    *
@@ -7910,6 +8932,7 @@ function vistaPreviaLight() {
   if (aplicar) mandos.insertBefore(aplicar, ultima());
   const montar = botonRenderizarLight();
   if (montar) mandos.insertBefore(montar, ultima());
+  caja.appendChild(bloqueTextoVideoLight());
   BARRA_INFERIOR.nodo = mandos;
   return caja;
 }
@@ -7946,11 +8969,24 @@ function cuadroFeedbackEscena(escena) {
   const mias = PREVIA.notas.filter(
     n => (n.plano || '') === escena.id && n.estado !== 'aplicado');
   const caja = h('div', { clase: 'previa-feedback' });
+
+  /* 1. NARRACIÓN DEL PLANO: muestra qué texto del guion se está locutando */
+  if (escena.narracion) {
+    caja.appendChild(h('div', {
+      clase: 'previa-narracion-caja',
+      style: 'margin-bottom: 12px; padding: 10px 14px; background: var(--hueco); border-left: 3px solid var(--acento); border-radius: 6px; font-size: 13px;'
+    },
+      h('div', { style: 'font-weight: 600; color: var(--acento); margin-bottom: 4px; font-size: 12px;' }, `🗣️ Narración del plano ${escena.id}:`),
+      h('div', { style: 'color: var(--texto); font-style: italic; line-height: 1.4;' }, `«${escena.narracion}»`)
+    ));
+  }
+
+  /* 2. SUGERENCIAS / FEEDBACK EN ESPAÑOL */
   caja.appendChild(campoArea(
     `¿Qué cambiarías de ${escena.id}?`,
     PREVIA.borrador[escena.id] || '',
     valor => { PREVIA.borrador[escena.id] = valor; },
-    'lo que ves y no cuadra con lo que se oye',
+    'lo que ves y no cuadra con lo que se oye (en español: "cambiar la ropa", "hacer el coche rojo", etc.)',
     `feedback:${escena.id}`));
   /* Una referencia dibuja más que una frase: «el ordenador tiene que ser
      como ESTE». Va con la nota y el corrector la adjunta al generador con la
@@ -7960,21 +8996,299 @@ function cuadroFeedbackEscena(escena) {
     leer: () => PREVIA.adjuntos[escena.id] || [],
     escribir: nombres => { PREVIA.adjuntos[escena.id] = nombres; },
   }));
-  caja.appendChild(h('div', { clase: 'fila' },
+  const estadoImg = estadoDeImagen(escena.id);
+  const estaCorriendo = estadoImg === 'corriendo' || COLA_IMG.corriendo.some(x => x.sid === escena.id);
+  const estaEnEspera = estadoImg === 'en cola' || COLA_IMG.espera.some(x => x.sid === escena.id);
+  let textoBotonRegenerar = '⟳ Regenerar imagen';
+  if (estaCorriendo) textoBotonRegenerar = 'Regenerando…';
+  else if (estaEnEspera) textoBotonRegenerar = 'En cola…';
+
+  caja.appendChild(h('div', { clase: 'fila', style: 'align-items: center; gap: 8px;' },
     h('button', {
       clase: 'mini primario', disabled: PREVIA.guardando,
       onclick: () => guardarNotaEscena(escena),
     }, PREVIA.guardando ? 'guardando…' : 'Apuntar'),
+    h('button', {
+      clase: 'mini' + (estaCorriendo || estaEnEspera ? '' : ' secundario'),
+      disabled: estaCorriendo || estaEnEspera || PREVIA.guardando,
+      title: 'Vuelve a generar la imagen de este plano ahora mismo',
+      onclick: () => {
+        encolarImagen(escena.id, PREVIA.borrador[escena.id] || '');
+      }
+    }, textoBotonRegenerar),
     h('span', { clase: 'meta' },
       mias.length ? `${mias.length} nota(s) en esta imagen`
-        : 'cada nota trae su botón para rehacer ESA imagen: el corrector lee la nota, '
-          + 'mira las imágenes del vídeo (este plano, los vecinos, las hojas, las láminas) '
-          + 'y adjunta al generador lo que la nota pide')));
+        : 'cada nota trae su botón para rehacer ESA imagen, o pulsa Regenerar imagen')));
+
+  /* 3. PROMPT TÉCNICO EN INGLÉS (AVANZADO: VER O EDITAR DIRECTAMENTE) */
+  if (escena.prompt !== undefined) {
+    if (!PREVIA.promptBorrador) PREVIA.promptBorrador = {};
+    if (PREVIA.promptBorrador[escena.id] === undefined) {
+      PREVIA.promptBorrador[escena.id] = escena.prompt || '';
+    }
+    const detalles = h('details', {
+      clase: 'bloque-prompt-tecnico',
+      style: 'margin-top: 14px; border: 1px dashed var(--linea); border-radius: 8px; padding: 10px 14px; background: rgba(255,255,255,0.02);'
+    });
+    detalles.appendChild(h('summary', {
+      style: 'cursor: pointer; font-weight: 600; color: var(--tenue); font-size: 13px; user-select: none;'
+    }, `🔧 Prompt de la imagen en inglés (avanzado: ver y editar)`));
+
+    const cuerpoPrompt = h('div', { style: 'margin-top: 10px;' });
+    cuerpoPrompt.appendChild(h('p', { clase: 'meta', style: 'margin-bottom: 8px; font-size: 12px; line-height: 1.4;' },
+      'Este es el prompt que se envía al modelo generador de imágenes. Si Google lo rechazó por filtros de seguridad (política de personas reales, marcas o palabras sensibles), o si prefieres ajustar o reemplazar la descripción directamente, puedes editarlo aquí:'));
+
+    const areaPrompt = h('textarea', {
+      rows: 4,
+      style: 'width: 100%; box-sizing: border-box; font-family: monospace; font-size: 12px; line-height: 1.4; padding: 8px; border-radius: 6px; background: var(--hueco); border: 1px solid var(--linea); color: var(--texto); resize: vertical;',
+    });
+    areaPrompt.value = PREVIA.promptBorrador[escena.id];
+    areaPrompt.oninput = () => { PREVIA.promptBorrador[escena.id] = areaPrompt.value; };
+    cuerpoPrompt.appendChild(areaPrompt);
+
+    const filaBotones = h('div', { clase: 'fila', style: 'margin-top: 8px; gap: 8px; align-items: center; flex-wrap: wrap;' },
+      h('button', {
+        clase: 'mini primario',
+        disabled: PREVIA.guardandoPrompt === escena.id,
+        onclick: async () => {
+          await guardarNuevoPrompt(escena, areaPrompt.value);
+        }
+      }, PREVIA.guardandoPrompt === escena.id ? 'guardando…' : '💾 Guardar prompt'),
+      h('button', {
+        clase: 'mini',
+        disabled: PREVIA.guardandoPrompt === escena.id,
+        title: 'Guarda este prompt y regenera la imagen de este plano ahora mismo',
+        onclick: async () => {
+          const ok = await guardarNuevoPrompt(escena, areaPrompt.value);
+          if (ok) encolarImagen(escena.id, '');
+        }
+      }, '⚡ Guardar y regenerar plano'),
+      h('button', {
+        clase: 'mini fantasma',
+        onclick: () => {
+          areaPrompt.value = escena.prompt || '';
+          PREVIA.promptBorrador[escena.id] = areaPrompt.value;
+          toast('Prompt restaurado');
+        }
+      }, 'Restablecer')
+    );
+    cuerpoPrompt.appendChild(filaBotones);
+    detalles.appendChild(cuerpoPrompt);
+    caja.appendChild(detalles);
+  }
+
+  /* 4. CLIP DE VÍDEO FLOW */
+  if (escena.es_video || escena.flow_num || escena.video) {
+    const cajaFlow = h('div', {
+      clase: 'previa-flow-caja',
+      style: 'margin-top: 14px; padding: 12px 14px; background: rgba(0, 229, 255, 0.05); border: 1px solid rgba(0, 229, 255, 0.3); border-radius: 8px;'
+    });
+
+    const tituloFlow = h('div', {
+      style: 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; flex-wrap: wrap; gap: 6px;'
+    },
+      h('div', { style: 'font-weight: 700; color: #00e5ff; font-size: 13px; display: flex; align-items: center; gap: 8px;' },
+        `🎬 Clip animado Flow ${escena.flow_num ? `#${escena.flow_num}` : ''}`,
+        escena.cuarta_pared ? h('span', {
+          style: 'color: #ff5252; background: rgba(255,82,82,0.15); border: 1px solid rgba(255,82,82,0.4); padding: 1px 6px; border-radius: 3px; font-size: 11px;'
+        }, 'CUARTA PARED') : null
+      ),
+      h('span', {
+        style: 'font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px; background: ' + (escena.video ? 'rgba(0,230,118,0.15); color: #00e676; border: 1px solid rgba(0,230,118,0.3);' : 'rgba(255,145,0,0.15); color: #ff9100; border: 1px solid rgba(255,145,0,0.3);')
+      }, escena.video ? '✓ Vídeo listo' : '⏳ Pendiente de subir')
+    );
+    cajaFlow.appendChild(tituloFlow);
+
+    cajaFlow.appendChild(h('div', {
+      style: 'font-size: 11px; color: var(--tenue); margin-bottom: 8px;'
+    }, `⏱️ Locución: ${(escena.duracion || 0).toFixed(1)} s · Recomendado en Flow: 8 s (el montaje ajustará la duración al audio automáticamente)`));
+
+    if (escena.flow_prompt) {
+      cajaFlow.appendChild(h('div', { style: 'font-size: 12px; color: var(--tenue); margin-bottom: 6px;' },
+        'Prompt en inglés para Google Flow Video (8 segundos):'));
+      const promptBox = h('div', {
+        style: 'background: var(--hueco); padding: 8px 10px; border-radius: 6px; font-family: monospace; font-size: 11px; color: var(--texto); line-height: 1.4; margin-bottom: 10px; border: 1px solid var(--linea); user-select: text; white-space: pre-wrap;'
+      }, escena.flow_prompt);
+      cajaFlow.appendChild(promptBox);
+
+      const filaBotonesPrompt = h('div', { style: 'display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap;' },
+        h('button', {
+          clase: 'mini',
+          onclick: () => {
+            navigator.clipboard.writeText(escena.flow_prompt).then(() => toast('¡Prompt de Flow copiado al portapapeles!'));
+          }
+        }, '📋 Copiar prompt para Flow'),
+        h('button', {
+          clase: 'mini fantasma',
+          disabled: PREVIA.generandoFlowPrompt === escena.id,
+          onclick: () => generarFlowPrompt(escena)
+        }, PREVIA.generandoFlowPrompt === escena.id ? 'Regenerando…' : '✨ Regenerar prompt con IA')
+      );
+      cajaFlow.appendChild(filaBotonesPrompt);
+    } else {
+      cajaFlow.appendChild(h('div', { style: 'margin-bottom: 12px;' },
+        h('button', {
+          clase: 'mini primario',
+          disabled: PREVIA.generandoFlowPrompt === escena.id,
+          onclick: () => generarFlowPrompt(escena)
+        }, PREVIA.generandoFlowPrompt === escena.id ? 'Generando prompt…' : '✨ Formular prompt cinemático para Flow')
+      ));
+    }
+
+    const inputArchivo = h('input', {
+      type: 'file',
+      accept: 'video/mp4,video/*',
+      style: 'display: none;',
+      onchange: async ev => {
+        const file = ev.target.files && ev.target.files[0];
+        if (!file) return;
+        toast(`Subiendo ${file.name} para escena ${escena.id}…`);
+        try {
+          const form = new FormData();
+          form.append('archivo', file);
+          const res = await fetch(API.escenaVideo(videoAbierto().pid, escena.id), {
+            method: 'POST',
+            body: form
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json().catch(() => ({}));
+          escena.video = data.video || API.escenaVideo(videoAbierto().pid, escena.id);
+          escena.es_video = true;
+          toast(`✓ Vídeo asignado a ${escena.id}`);
+          await cargarPreviaLight(escena.id);
+        } catch (err) {
+          toast(`Error al subir vídeo: ${err.message}`, true);
+        }
+      }
+    });
+    cajaFlow.appendChild(inputArchivo);
+
+    const filaAcciones = h('div', { style: 'display: flex; gap: 10px; align-items: center; flex-wrap: wrap;' },
+      h('button', {
+        clase: 'mini primario',
+        onclick: () => inputArchivo.click()
+      }, escena.video ? '🔄 Reemplazar vídeo .mp4' : '📤 Subir clip .mp4'),
+      h('span', { style: 'font-size: 11px; color: var(--tenue);' },
+        `Guardar como: flow/videos/${escena.id}.mp4` + (escena.flow_num ? ` o flow_${escena.flow_num}.mp4` : ''))
+    );
+    cajaFlow.appendChild(filaAcciones);
+
+    caja.appendChild(cajaFlow);
+  } else {
+    /* OPCIÓN PARA CUALQUIER ESCENA: Convertir a vídeo animado / generar prompt Flow */
+    const cajaConvertir = h('div', {
+      clase: 'previa-convertir-video',
+      style: 'margin-top: 14px; padding: 12px 14px; background: rgba(0, 229, 255, 0.03); border: 1px dashed rgba(0, 229, 255, 0.35); border-radius: 8px;'
+    });
+
+    const inputArchivoDirecto = h('input', {
+      type: 'file',
+      accept: 'video/mp4,video/*',
+      style: 'display: none;',
+      onchange: async ev => {
+        const file = ev.target.files && ev.target.files[0];
+        if (!file) return;
+        toast(`Subiendo ${file.name} para escena ${escena.id}…`);
+        try {
+          const form = new FormData();
+          form.append('archivo', file);
+          const res = await fetch(API.escenaVideo(videoAbierto().pid, escena.id), {
+            method: 'POST',
+            body: form
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json().catch(() => ({}));
+          escena.video = data.video || API.escenaVideo(videoAbierto().pid, escena.id);
+          escena.es_video = true;
+          toast(`✓ Vídeo asignado a ${escena.id}`);
+          await cargarPreviaLight(escena.id);
+        } catch (err) {
+          toast(`Error al subir vídeo: ${err.message}`, true);
+        }
+      }
+    });
+    cajaConvertir.appendChild(inputArchivoDirecto);
+
+    cajaConvertir.appendChild(h('div', { style: 'display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-bottom: 6px;' },
+      h('div', { style: 'font-weight: 700; color: #00e5ff; font-size: 13px; display: flex; align-items: center; gap: 6px;' },
+        '🎬 ¿Quieres que este plano sea un vídeo en movimiento?'),
+      h('span', { style: 'font-size: 11px; color: var(--tenue);' },
+        `Duración locución: ${(escena.duracion || 0).toFixed(1)} s`)
+    ));
+
+    cajaConvertir.appendChild(h('div', { style: 'font-size: 12px; color: var(--tenue); line-height: 1.4; margin-bottom: 10px;' },
+      'Puedes generar un prompt optimizado para Google Flow Video (8 s) adaptado al guion y estilo, o subir directamente cualquier archivo de vídeo .mp4:'));
+
+    const filaBtnsConvertir = h('div', { style: 'display: flex; gap: 8px; align-items: center; flex-wrap: wrap;' },
+      h('button', {
+        clase: 'mini primario',
+        disabled: PREVIA.generandoFlowPrompt === escena.id,
+        onclick: () => generarFlowPrompt(escena)
+      }, PREVIA.generandoFlowPrompt === escena.id ? 'Generando prompt…' : '✨ Generar prompt para Flow'),
+      h('button', {
+        clase: 'mini fantasma',
+        onclick: () => inputArchivoDirecto.click()
+      }, '📤 Subir .mp4 directo')
+    );
+    cajaConvertir.appendChild(filaBtnsConvertir);
+
+    caja.appendChild(cajaConvertir);
+  }
+
   if (esTactil()) {
     caja.appendChild(h('div', { clase: 'meta previa-pista' },
       'desliza sobre la imagen para pasar de escena'));
   }
   return caja;
+}
+
+async function guardarNuevoPrompt(escena, nuevoPrompt) {
+  const limpio = String(nuevoPrompt || '').trim();
+  if (!limpio) { toast('el prompt no puede estar vacío', true); return false; }
+  const v = videoAbierto();
+  if (!v || !v.pid) return false;
+  PREVIA.guardandoPrompt = escena.id;
+  repintarVideo();
+  try {
+    const res = await pedir(`${API.proyecto(v.pid)}/escenas/${escena.id}/prompt`, {
+      method: 'PUT',
+      cuerpo: { prompt: limpio }
+    });
+    escena.prompt = limpio;
+    if (PREVIA.promptBorrador) PREVIA.promptBorrador[escena.id] = limpio;
+    toast(`Prompt de ${escena.id} guardado correctamente`);
+    return true;
+  } catch (err) {
+    mostrarError(CLAVE_VIDEO_LIGHT, err);
+    return false;
+  } finally {
+    PREVIA.guardandoPrompt = null;
+    repintarVideo();
+  }
+}
+
+async function generarFlowPrompt(escena) {
+  const v = videoAbierto();
+  if (!v || !v.pid) return;
+  PREVIA.generandoFlowPrompt = escena.id;
+  repintarVideo();
+  try {
+    toast(`Generando prompt cinemático para ${escena.id}…`);
+    const res = await pedir(API.escenaFlowPrompt(v.pid, escena.id), {
+      method: 'POST'
+    });
+    if (res && res.flow_prompt) {
+      escena.flow_prompt = res.flow_prompt;
+      escena.es_video = true;
+    }
+    toast(`✓ Prompt para Flow generado para ${escena.id}`);
+    await cargarPreviaLight(escena.id);
+  } catch (err) {
+    toast(`Error generando prompt de Flow: ${err.message}`, true);
+  } finally {
+    PREVIA.generandoFlowPrompt = null;
+    repintarVideo();
+  }
 }
 
 /* UNA NOTA SE EDITA Y SE BORRA, sin preguntar. Lo que se escribe aquí es una
@@ -8079,6 +9393,153 @@ async function guardarNotaEscena(escena) {
   repintarVideo();
 }
 
+async function limpiarNotasAplicadas() {
+  const v = videoAbierto();
+  if (!v || !v.pid) return;
+  const aplicadas = (estadoRepaso().notas || []).filter(n => n.estado === 'aplicado');
+  if (!aplicadas.length) {
+    toast('No hay notas aplicadas para limpiar');
+    return;
+  }
+  toast(`Limpiando ${aplicadas.length} notas aplicadas…`);
+  try {
+    for (const nota of aplicadas) {
+      await pedir(`${API.repaso(v.pid)}/${nota.id}`, { method: 'DELETE' }).catch(() => {});
+    }
+    await refrescarNotasPrevia();
+    toast('✓ Historial de notas resueltas limpiado');
+    repintarVideo();
+  } catch (err) {
+    toast(`Error al limpiar notas: ${err.message}`, true);
+  }
+}
+
+function seccionNotasPrevia(escena) {
+  const v = videoAbierto();
+  const sid = (escena && escena.id) || '';
+  const todas = notasDeAhora();
+  if (!todas.length) return null;
+
+  if (PREVIA.filtroNotasPlano === undefined) PREVIA.filtroNotasPlano = 'este_plano';
+  if (PREVIA.mostrarResueltas === undefined) PREVIA.mostrarResueltas = false;
+  if (PREVIA.plegadoNotas === undefined) PREVIA.plegadoNotas = false;
+
+  const deEstaEscena = todas.filter(n => (n.plano || '') === sid);
+  const pendientesEsta = deEstaEscena.filter(n => n.estado !== 'aplicado');
+  const resueltasEsta = deEstaEscena.filter(n => n.estado === 'aplicado');
+
+  const pendientesOtras = todas.filter(n => (n.plano || '') !== sid && n.estado !== 'aplicado');
+  const resueltasTodas = todas.filter(n => n.estado === 'aplicado');
+  const pendientesTodas = todas.filter(n => n.estado !== 'aplicado');
+
+  const soloEstePlano = PREVIA.filtroNotasPlano === 'este_plano';
+
+  let listaMostrar = soloEstePlano ? deEstaEscena : todas;
+  if (!PREVIA.mostrarResueltas) {
+    listaMostrar = listaMostrar.filter(n => n.estado !== 'aplicado');
+  }
+
+  const contenedor = h('div', {
+    clase: 'seccion-notas-previa',
+    style: 'margin-top: 14px; background: rgba(255,255,255,0.02); border: 1px solid var(--linea); border-radius: 8px; padding: 12px 14px;'
+  });
+
+  const cabecera = h('div', {
+    style: 'display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px;'
+  });
+
+  const ladoIzq = h('div', { style: 'display: flex; align-items: center; gap: 8px; flex-wrap: wrap;' },
+    h('b', { style: 'font-size: 13px; color: var(--texto);' }, '📝 Ajustes y notas'),
+    soloEstePlano
+      ? (pendientesEsta.length
+          ? h('span', { style: 'font-size: 11px; padding: 2px 7px; border-radius: 10px; background: rgba(255,145,0,0.15); color: #ff9100; font-weight: 600;' },
+              `${pendientesEsta.length} pendiente${pendientesEsta.length > 1 ? 's' : ''} en ${sid}`)
+          : h('span', { style: 'font-size: 11px; padding: 2px 7px; border-radius: 10px; background: rgba(0,230,118,0.12); color: #00e676; font-weight: 600;' },
+              `✓ Al día en ${sid}`))
+      : h('span', { style: 'font-size: 11px; padding: 2px 7px; border-radius: 10px; background: rgba(0,229,255,0.12); color: #00e5ff; font-weight: 600;' },
+          `${pendientesTodas.length} pendiente${pendientesTodas.length !== 1 ? 's' : ''} en total`)
+  );
+
+  const ladoDer = h('div', { style: 'display: flex; align-items: center; gap: 6px; flex-wrap: wrap;' });
+
+  // Botón conmutador: Solo este plano vs Todas las escenas
+  const btnSoloPlano = h('button', {
+    clase: soloEstePlano ? 'mini primario' : 'mini fantasma',
+    style: 'font-size: 11px;',
+    title: `Mostrar solo los ajustes del plano ${sid}`,
+    onclick: () => { PREVIA.filtroNotasPlano = 'este_plano'; repintarVideo(); }
+  }, `📌 Solo ${sid} (${pendientesEsta.length})`);
+  ladoDer.appendChild(btnSoloPlano);
+
+  const btnTodosPlanos = h('button', {
+    clase: !soloEstePlano ? 'mini primario' : 'mini fantasma',
+    style: 'font-size: 11px;',
+    title: `Mostrar ajustes de todas las escenas (${pendientesTodas.length} pendientes)`,
+    onclick: () => { PREVIA.filtroNotasPlano = 'todos'; repintarVideo(); }
+  }, `🌐 Todas (${pendientesTodas.length})`);
+  ladoDer.appendChild(btnTodosPlanos);
+
+  // Botón conmutador: Ver / Ocultar notas resueltas
+  const totalResueltasContexto = soloEstePlano ? resueltasEsta.length : resueltasTodas.length;
+  if (totalResueltasContexto > 0) {
+    const btnResueltas = h('button', {
+      clase: PREVIA.mostrarResueltas ? 'mini primario' : 'mini fantasma',
+      style: 'font-size: 11px;',
+      title: PREVIA.mostrarResueltas ? 'Ocultar las notas ya aplicadas' : 'Ver las notas que ya fueron aplicadas/regeneradas',
+      onclick: () => { PREVIA.mostrarResueltas = !PREVIA.mostrarResueltas; repintarVideo(); }
+    }, PREVIA.mostrarResueltas ? '👁️ Ocultar resueltas' : `👁️ Ver ${totalResueltasContexto} resuelta${totalResueltasContexto > 1 ? 's' : ''}`);
+    ladoDer.appendChild(btnResueltas);
+  }
+
+  // Botón Limpiar resueltas
+  if (resueltasTodas.length > 0) {
+    const btnLimpiar = h('button', {
+      clase: 'mini fantasma',
+      style: 'font-size: 11px; color: var(--tenue);',
+      title: `Eliminar definitivamente del historial las ${resueltasTodas.length} notas ya aplicadas`,
+      onclick: async () => {
+        if (window.confirm(`¿Eliminar del historial las ${resueltasTodas.length} notas que ya fueron aplicadas?`)) {
+          await limpiarNotasAplicadas();
+        }
+      }
+    }, `🧹 Limpiar resueltas (${resueltasTodas.length})`);
+    ladoDer.appendChild(btnLimpiar);
+  }
+
+  // Botón plegar / desplegar
+  const btnPlegar = h('button', {
+    clase: 'mini fantasma',
+    style: 'font-size: 11px; padding: 2px 6px;',
+    title: PREVIA.plegadoNotas ? 'Desplegar lista de notas' : 'Plegar lista de notas',
+    onclick: () => { PREVIA.plegadoNotas = !PREVIA.plegadoNotas; repintarVideo(); }
+  }, PREVIA.plegadoNotas ? '▼' : '▲');
+  ladoDer.appendChild(btnPlegar);
+
+  cabecera.appendChild(ladoIzq);
+  cabecera.appendChild(ladoDer);
+  contenedor.appendChild(cabecera);
+
+  if (!PREVIA.plegadoNotas) {
+    if (soloEstePlano && !pendientesEsta.length && !PREVIA.mostrarResueltas) {
+      const avisoVacio = h('div', {
+        style: 'padding: 8px 12px; background: var(--hueco); border-radius: 6px; font-size: 12px; color: var(--tenue); display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;'
+      },
+        h('span', {}, `✓ No hay ajustes pendientes en ${sid}.`),
+        pendientesOtras.length ? h('button', {
+          clase: 'mini fantasma',
+          style: 'font-size: 11px;',
+          onclick: () => { PREVIA.filtroNotasPlano = 'todos'; repintarVideo(); }
+        }, `Ver ${pendientesOtras.length} nota${pendientesOtras.length > 1 ? 's' : ''} en otros planos ›`) : null
+      );
+      contenedor.appendChild(avisoVacio);
+    } else {
+      contenedor.appendChild(listaDeNotas(listaMostrar));
+    }
+  }
+
+  return contenedor;
+}
+
 /* Montar el MP4 es lo que se hace CUANDO YA HAS MIRADO, así que el botón vive
    aquí y no en la tanda anterior (ver TANDAS_LIGHT en app.py). */
 /* IR AL VIDEO. Y MONTARLO SOLO SI HACE FALTA.
@@ -8168,7 +9629,13 @@ function vistaVideoLight() {
   if (error) caja.appendChild(cajaError(error));
 
   const marco = h('div', { clase: `marco-video ${formatoDelVideo()}` });
-  if (hayMp4Light() && !trabajoVideoLight()) {
+  if (trabajoVideoLight()) vigilarMirilla();
+  if (trabajoVideoLight() && (v.mirilla || []).length) {
+    /* LA MIRILLA: lo último que ha dibujado cada navegador (ver
+       `vigilarMirilla`). Manda sobre la imagen suelta de abajo mientras se
+       monta el MP4: aquello es lo generado en la tanda de imágenes. */
+    marco.appendChild(enVivo(pintarMirilla));
+  } else if (hayMp4Light() && !trabajoVideoLight()) {
     marco.appendChild(videoLight());
   } else if (v.planos.length) {
     // el último que ha caído, grande: es lo que se acaba de generar
@@ -8260,6 +9727,13 @@ function vistaVideoLight() {
      nada que comentar, y una caja de texto vacía debajo de una barra de
      progreso invita a escribir sobre algo que todavía no existe. */
   if (hayMp4Light() && !trabajoVideoLight()) caja.appendChild(panelRepaso());
+  if (!trabajoVideoLight()) {
+    caja.appendChild(bloqueTextoVideoLight());
+  }
+  if (hayMp4Light() && !trabajoVideoLight()) {
+    const publicar = tarjetaPublicar();
+    if (publicar) caja.appendChild(publicar);
+  }
   return caja;
 }
 /* ==========================================================================
@@ -8395,14 +9869,31 @@ function botonComentar() {
       'pausa el vídeo donde quieras y pulsa aquí'));
 }
 
+function saltarDeVideoAImagenes(sid) {
+  if (!sid) return;
+  const escenas = (PREVIA.ficha || {}).escenas || [];
+  const idx = escenas.findIndex(e => e.id === sid);
+  if (idx >= 0) {
+    PREVIA.i = idx;
+    PREVIA.vistaRejilla = false;
+  }
+  irA('imagenes');
+}
+
 /* La caja de escribir: el texto (obligatorio) y las imágenes que se arrastren
    encima. Es el mismo gesto que en los estilos —arrastrar o pulsar— porque son
    la misma cosa: enseñar una referencia. */
 function cajaDeNota() {
   const r = estadoRepaso();
   const caja = h('div', { clase: 'repaso-nueva' });
-  caja.appendChild(h('div', { clase: 'meta' },
-    `en ${mmss(r.t)}` + (r.plano ? ` · plano ${r.plano}` : '')));
+  caja.appendChild(h('div', { clase: 'meta', style: 'display: flex; justify-content: space-between; align-items: center;' },
+    h('span', {}, `en ${mmss(r.t)}` + (r.plano ? ` · plano ${r.plano}` : '')),
+    r.plano ? h('button', {
+      clase: 'mini fantasma',
+      style: 'font-size: 11px; padding: 2px 8px;',
+      title: `Ir a la pestaña Imágenes para ver o editar el prompt de ${r.plano}`,
+      onclick: () => saltarDeVideoAImagenes(r.plano)
+    }, `🔍 Ver ${r.plano} en Imágenes`) : null));
 
   const area = h('textarea', {
     rows: 3, placeholder: 'qué no encaja aquí, en una frase',
@@ -8629,6 +10120,538 @@ function estadoDeImagen(sid, nota) {
 }
 
 
+/* ==================================================== LAS IMÁGENES DE FLOW
+ *
+ * Un vídeo con «Imágenes: Google Flow» recorre la misma tanda que cualquier
+ * otro, pero al llegar a los planos se PARA sin error si falta alguna imagen
+ * (`_correr_puerta_flow` en app.py): deja escritos los prompts y espera. Esta
+ * tarjeta es lo que se ve en esa parada, y es la que dice por dónde se sigue:
+ *
+ *   1. bajar la tanda (tanda.json) y cargarla en el panel de la extensión,
+ *   2. en Flow, plano a plano: copiar el prompt, pegarlo, generar, descargar,
+ *   3. «Importar de Flow y seguir»: trae lo descargado y, si ya están todas,
+ *      vuelve a lanzar la tanda de las imágenes, que ahora las adopta.
+ *
+ * Se ve también cuando todo está puesto pero hay imágenes REHECHAS en Flow
+ * esperando en la carpeta de descargas: importarlas es la única forma de
+ * cambiar una imagen en este modo.
+ */
+function flowDelVideo() {
+  const v = videoAbierto();
+  return (v && v.flow && v.flow.pid === v.pid) ? v.flow.datos : null;
+}
+
+function videoConFlow() {
+  const datos = flowDelVideo();
+  return !!(datos && datos.activo);
+}
+
+async function cargarFlowLight() {
+  const v = videoAbierto();
+  if (!v || !v.pid || v.flowCargando) return;
+  const pid = v.pid;
+  v.flowCargando = true;
+  try {
+    const datos = await pedir(API.flow(pid));
+    v.flow = { pid, datos };
+  } catch (e) {
+    v.flow = { pid, datos: null, error: e.message };
+  } finally {
+    v.flowCargando = false;
+    v.flowSucio = false;
+  }
+  pintarLight();
+}
+
+async function importarFlowLight() {
+  const v = videoAbierto();
+  if (!v || !v.pid) return;
+  v.flowOcupado = true;
+  pintarLight();
+  try {
+    const datos = await pedir(API.flowImportar(v.pid), { method: 'POST' });
+    v.flow = { pid: v.pid, datos };
+    const copiadas = (datos.copiadas || []).length;
+    if (datos.faltan && datos.faltan.length) {
+      toast(`${copiadas ? `${copiadas} importadas; ` : ''}faltan ${datos.faltan.length}: `
+        + datos.faltan.slice(0, 8).join(', ') + (datos.faltan.length > 8 ? '…' : ''),
+      !copiadas);
+    } else {
+      toast(copiadas ? `${copiadas} importadas: seguimos con los planos`
+        : 'están todas: seguimos con los planos');
+      /* LA MISMA TANDA DE SIEMPRE, en «pendientes»: ahora la puerta de Flow
+         encuentra todas las imágenes y las adopta, a coste cero. */
+      await lanzarTandaLight('video');
+    }
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    v.flowOcupado = false;
+    pintarLight();
+  }
+}
+
+async function exportarFlowLight(sugerir) {
+  const v = videoAbierto();
+  if (!v || !v.pid) return;
+  if (sugerir && !window.confirm('¿Pedir otra frase de estilo? Las imágenes que '
+    + 'ya has hecho se quedaron con la anterior: cambiarla a mitad de vídeo hace '
+    + 'que unas y otras no se parezcan.')) return;
+  v.flowOcupado = true;
+  pintarLight();
+  try {
+    const datos = await pedir(API.flowExportar(v.pid),
+      { method: 'POST', cuerpo: { sugerir: !!sugerir } });
+    v.flow = { pid: v.pid, datos };
+    toast(sugerir ? 'frase de estilo nueva: vuelve a bajar la tanda' : 'prompts preparados');
+    if ((datos.movidas || []).length) {
+      toast(`el corte ha cambiado: ${datos.movidas.join(', ')} eran de otra frase`, true);
+    }
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    v.flowOcupado = false;
+    pintarLight();
+  }
+}
+
+function tarjetaFlowLight() {
+  const v = videoAbierto();
+  if (!v || !v.pid) return null;
+  if (!v.flow || v.flow.pid !== v.pid || v.flowSucio) {
+    if (!v.flowCargando) setTimeout(cargarFlowLight, 0);
+    return null;
+  }
+  const datos = v.flow.datos;
+  if (!datos || !datos.activo) return null;
+  const faltan = datos.faltan || [];
+  const nuevas = datos.por_importar || [];
+  const ocupado = !!v.flowOcupado;
+  const corriendo = (APP.trabajos[CLAVE_VIDEO_LIGHT] || {}).estado === 'ejecutando';
+  /* TODO PUESTO Y NADA NUEVO EN DESCARGAS: una línea y no una tarjeta. Lo que
+     hay que mirar entonces son las imágenes, no las instrucciones. */
+  if (datos.exportado && !faltan.length && !nuevas.length) {
+    return h('div', { clase: 'flow-linea meta' },
+      `Imágenes de Google Flow: las ${datos.total} puestas. Para cambiar una, `
+      + 'rehazla en Flow con su id y pulsa «Importar de Flow».',
+      h('button', {
+        clase: 'mini fantasma', disabled: ocupado || corriendo,
+        onclick: importarFlowLight,
+      }, 'Importar de Flow'));
+  }
+  const caja = h('section', { clase: 'flow-tarjeta' },
+    h('div', { clase: 'fila' },
+      h('h3', {}, '🎨 Imágenes en Google Flow'),
+      h('span', { clase: 'crece' }),
+      datos.exportado
+        ? pastillaEstado(faltan.length ? 'parcial' : 'ok',
+          `${datos.listas} de ${datos.total}`)
+        : pastillaEstado('', 'sin preparar')));
+  if (!datos.exportado) {
+    caja.appendChild(h('div', { clase: 'pista' },
+      'Todavía no están los prompts. «Generar las imágenes» corta el vídeo en '
+      + 'planos, escribe un prompt por plano y se para aquí para que los hagas '
+      + 'en Flow.'));
+    caja.appendChild(h('div', { clase: 'fila' },
+      h('button', {
+        clase: 'primario', disabled: ocupado || corriendo,
+        onclick: () => lanzarTandaLight('video'),
+      }, corriendo ? 'preparando…' : 'Preparar los prompts')));
+    return caja;
+  }
+  const pasos = h('ol', { clase: 'flow-pasos' },
+    h('li', {},
+      h('a', {
+        clase: 'boton mini', href: API.flowTanda(v.pid), download: `tanda_${v.pid}.json`,
+      }, 'Bajar la tanda'),
+      ' y cárgala en el panel «Estudio → Flow» de la extensión, dentro de un '
+      + 'proyecto de Flow.'),
+    h('li', {}, 'Plano a plano: «Copiar prompt», pégalo en Flow, genera y '
+      + 'descarga la imagen con el botón de Flow. La extensión la guarda con el '
+      + 'nombre del plano; las hojas de personaje van primero.'),
+    h('li', {}, `Las descargas van a ${datos.descargas}. Cuando termines —o a `
+      + 'medias, para ir viendo—, «Importar de Flow y seguir».'));
+  caja.appendChild(pasos);
+  caja.appendChild(h('div', { clase: 'meta' },
+    faltan.length
+      ? `Faltan ${faltan.length}: ${faltan.slice(0, 10).join(', ')}`
+        + (faltan.length > 10 ? '…' : '')
+      : 'Están todas.',
+    nuevas.length ? ` · ${nuevas.length} en Descargas por importar` : ''));
+  caja.appendChild(h('div', { clase: 'fila' },
+    h('button', {
+      clase: 'primario', disabled: ocupado || corriendo,
+      onclick: importarFlowLight,
+    }, ocupado ? 'importando…' : 'Importar de Flow y seguir'),
+    h('span', { clase: 'crece' })));
+  caja.appendChild(plegable('La frase de estilo', {
+    clave: 'flow-estilo', resumen: 'va delante de cada prompt',
+  },
+    h('div', { clase: 'meta' }, datos.estilo || '(todavía ninguna)'),
+    h('div', { clase: 'fila' },
+      h('button', {
+        clase: 'mini fantasma', disabled: ocupado || corriendo,
+        onclick: () => exportarFlowLight(true),
+      }, 'Pedir otra frase'))));
+  caja.appendChild(plegable('¿No ves el panel en Flow?', {
+    clave: 'flow-extension', resumen: 'instalar la extensión de Chrome',
+  },
+    h('div', { clase: 'meta' },
+      'En Chrome, abre chrome://extensions, enciende «Modo de desarrollador», '
+      + '«Cargar descomprimida» y elige esta carpeta:'),
+    h('div', { clase: 'meta flow-ruta' }, datos.extension || '')));
+  return caja;
+}
+
+
+/* ==================================================== LA MIRILLA DEL RENDER
+ *
+ * Mientras se monta el MP4, lo último que ha dibujado cada navegador: una
+ * miniatura por plano en marcha, con «S003 · 120/185». No es el vídeo en orden
+ * —los navegadores trabajan a la vez en planos distintos—, es la prueba de que
+ * está vivo y la forma de ver un subtítulo mal puesto sin esperar al final.
+ * Solo lee lo que ya está en disco (`/render/mirilla`): no frena el render.
+ */
+function vigilarMirilla() {
+  const v = videoAbierto();
+  if (!v || v.mirillaTimer) return;
+  const tic = async () => {
+    const w = videoAbierto();
+    if (!w || !trabajoVideoLight() || w.vista !== 'video') {
+      clearInterval(w && w.mirillaTimer);
+      if (w) { w.mirillaTimer = null; w.mirilla = []; }
+      return;
+    }
+    const antes = (w.mirilla || []).length;
+    try {
+      w.mirilla = ((await pedir(API.mirilla(w.pid))) || {}).planos || [];
+    } catch (e) { return; }
+    // de «montando…» a las miniaturas cambia el marco entero; si no, solo lo vivo
+    if (!antes && w.mirilla.length) pintarLight();
+    else refrescarVivosLight();
+  };
+  v.mirillaTimer = setInterval(tic, 3000);
+  tic();
+}
+
+function pintarMirilla() {
+  const v = videoAbierto();
+  const planos = (v && v.mirilla) || [];
+  if (!planos.length) return h('div', { clase: 'vacio' }, 'montando los planos…');
+  return h('div', { clase: 'mirilla' }, ...planos.slice(0, 4).map(p => h('figure', {},
+    h('img', {
+      src: `${API.archivo(v.pid, p.ruta)}?mini=512`, alt: p.id,
+      /* el PNG de un plano que acaba de cerrarse se borra: se deja el hueco */
+      onerror: ev => { ev.target.classList.add('oculto'); },
+    }),
+    h('figcaption', {}, `${p.id} · ${p.hechos}/${p.total || '?'}`))));
+}
+
+
+/* ====================================================== PARA PUBLICAR
+ *
+ * Con el MP4 hecho: título, descripción y etiquetas para YouTube, y los
+ * CRÉDITOS de la música y los efectos que los piden (CC BY). Los créditos
+ * salen de lo que el render tiene puesto y se ven desde el primer momento; el
+ * texto lo propone el CLI de Claude cuando se pide. Se guarda también en
+ * `proyectos/<id>/publicacion.txt`.
+ */
+async function cargarPublicar() {
+  const v = videoAbierto();
+  if (!v || !v.pid || v.publicarCargando) return;
+  const pid = v.pid;
+  v.publicarCargando = true;
+  try {
+    v.publicar = { pid, datos: await pedir(API.publicar(pid)) };
+  } catch (e) {
+    v.publicar = { pid, datos: null, error: e.message };
+  } finally {
+    v.publicarCargando = false;
+  }
+  pintarLight();
+}
+
+async function proponerPublicar() {
+  const v = videoAbierto();
+  if (!v || !v.pid) return;
+  try {
+    const r = await pedir(API.publicar(v.pid), { method: 'POST' });
+    const tid = r.trabajo_id || (r.trabajo || {}).id;
+    seguirTrabajo('publicar', tid, async trabajo => {
+      if (trabajo.estado === 'listo') {
+        v.publicar = null;
+        await cargarPublicar();
+      }
+      pintarLight();
+    });
+    pintarLight();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function copiarTexto(texto, que) {
+  try {
+    await navigator.clipboard.writeText(texto);
+    toast(`${que} copiado`);
+  } catch (e) {
+    toast('no se ha podido copiar: selecciónalo y usa Ctrl+C', true);
+  }
+}
+
+function bloqueCopiable(titulo, texto, que) {
+  return h('div', { clase: 'publicar-bloque' },
+    h('div', { clase: 'fila' },
+      h('b', {}, titulo),
+      h('span', { clase: 'crece' }),
+      h('button', { clase: 'mini', onclick: () => copiarTexto(texto, que) }, 'Copiar')),
+    h('pre', { clase: 'publicar-texto' }, texto));
+}
+
+function tarjetaPublicar() {
+  const v = videoAbierto();
+  if (!v || !v.pid) return null;
+  if (!v.publicar || v.publicar.pid !== v.pid) {
+    if (!v.publicarCargando) setTimeout(cargarPublicar, 0);
+    return null;
+  }
+  const datos = v.publicar.datos;
+  if (!datos) return null;
+  const propuesta = datos.propuesta;
+  const creditos = datos.texto_creditos || '';
+  const pensando = trabajando('publicar');
+  const cuerpo = [];
+  if (propuesta) {
+    (propuesta.titulos || []).forEach((t, i) => cuerpo.push(h('div', { clase: 'fila publicar-titulo' },
+      h('span', { clase: 'crece' }, t),
+      h('button', { clase: 'mini fantasma', onclick: () => copiarTexto(t, `título ${i + 1}`) },
+        'Copiar'))));
+    const descripcion = [propuesta.descripcion || '', creditos].filter(Boolean).join('\n\n');
+    cuerpo.push(bloqueCopiable('Descripción (con los créditos al final)', descripcion,
+      'descripción'));
+    cuerpo.push(bloqueCopiable('Etiquetas', (propuesta.etiquetas || []).join(', '),
+      'etiquetas'));
+  } else if (creditos) {
+    cuerpo.push(bloqueCopiable('Créditos para la descripción', creditos, 'créditos'));
+  }
+  if (!creditos) {
+    cuerpo.push(h('div', { clase: 'meta' },
+      'La música y los efectos de este vídeo son de dominio público (CC0): no '
+      + 'hace falta citar a nadie.'));
+  }
+  cuerpo.push(h('div', { clase: 'fila' },
+    h('button', {
+      clase: propuesta ? 'mini' : 'primario', disabled: pensando,
+      onclick: proponerPublicar,
+    }, pensando ? 'escribiendo…' : (propuesta ? 'Proponer otros' : 'Proponer título y descripción')),
+    h('span', { clase: 'meta' },
+      'Lo escribe Claude a partir del guion: gasta cupo de tu plan, no dinero. '
+      + `También queda en ${datos.fichero}.`)));
+  return plegable('📣 Para publicar', {
+    clave: 'publicar', abierto: true,
+    resumen: propuesta ? `${(propuesta.titulos || []).length} títulos, descripción y créditos`
+      : (creditos ? 'créditos listos; el título y la descripción, cuando los pidas' : ''),
+  }, ...cuerpo);
+}
+
+
+/* ===================================================== TEXTO EN PANTALLA
+ *
+ * Cómo se ven los subtítulos: tamaño, la caja de detrás, cómo entran y salen,
+ * y el set de diseño (dibujo, realista, editorial). Todo existía en el motor
+ * (p7_callouts) pero solo se podía cambiar escribiendo una frase; aquí son
+ * mandos. El mismo bloque sirve en dos sitios:
+ *
+ *   en el ESTILO   vale para los vídeos NUEVOS de ese canal
+ *   en el VÍDEO    vale para ese vídeo: deja los rótulos obsoletos y se ve al
+ *                  volver a montar, que no toca ni imágenes ni voz (0 $)
+ *
+ * Nada se guarda al abrir: solo al tocar un mando (regla 1 del CLAUDE.md).
+ */
+const TEXTO_TAMANOS = [['pequeno', 'Pequeño'], ['normal', 'Normal'], ['grande', 'Grande'],
+  ['enorme', 'Enorme']];
+const TEXTO_CAJAS = [[0, 'Sin caja'], [0.35, 'Suave'], ['auto', 'Normal'], [0.85, 'Opaca']];
+const TEXTO_ANIMACIONES = [['auto', 'Automática'], ['fundido', 'Fundido'], ['corte', 'Corte seco']];
+const TEXTO_DISENOS = [['dibujo', 'Dibujo'], ['realista', 'Realista'], ['editorial', 'Editorial']];
+const TEXTO_ESTILOS_TECLADO = [
+  ['maquina', 'Máquina mecánica ⌨️'],
+  ['digital', 'Clic digital suave 💻'],
+  ['silencio', 'Sin sonido / Mudo 🔇'],
+];
+
+function probarSonidoTecleo(estilo, pid) {
+  if (estilo === 'silencio') {
+    toast('Modo silencioso: las cartelas no reproducirán sonido de tecleo 🔇');
+    return;
+  }
+  try {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext) {
+      toast(`Estilo seleccionado: ${estilo}`);
+      return;
+    }
+    const ctx = new AudioContext();
+
+    if (estilo === 'digital') {
+      // Clik digital sutil, limpio y moderno (5 pulsaciones a 80ms)
+      const tiempos = [0, 0.08, 0.16, 0.24, 0.32];
+      tiempos.forEach((t, i) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(1400 + (i % 3) * 150, ctx.currentTime + t);
+        osc.frequency.exponentialRampToValueAtTime(350, ctx.currentTime + t + 0.022);
+        gain.gain.setValueAtTime(0.18, ctx.currentTime + t);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + t + 0.022);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(ctx.currentTime + t);
+        osc.stop(ctx.currentTime + t + 0.025);
+      });
+      toast('🔊 Muestra: clics digitales sutiles sin campana');
+    } else {
+      // Máquina de escribir mecánica clásica + campanita de retorno
+      const tiempos = [0, 0.09, 0.18, 0.27, 0.38];
+      tiempos.forEach((t, i) => {
+        const bufferSize = Math.floor(ctx.sampleRate * 0.045);
+        const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+        const data = buffer.getChannelData(0);
+        for (let j = 0; j < bufferSize; j++) {
+          data[j] = (Math.random() * 2 - 1) * Math.exp(-j / (bufferSize * 0.22));
+        }
+        const noise = ctx.createBufferSource();
+        noise.buffer = buffer;
+        const filter = ctx.createBiquadFilter();
+        filter.type = 'bandpass';
+        filter.frequency.value = 750 + (i * 80);
+        filter.Q.value = 3.0;
+        const gain = ctx.createGain();
+        gain.gain.setValueAtTime(0.35, ctx.currentTime + t);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + t + 0.045);
+        noise.connect(filter);
+        filter.connect(gain);
+        gain.connect(ctx.destination);
+        noise.start(ctx.currentTime + t);
+      });
+      // Campanita ding de retorno de carro
+      const campana = ctx.createOscillator();
+      const gainCampana = ctx.createGain();
+      campana.type = 'sine';
+      campana.frequency.setValueAtTime(2450, ctx.currentTime + 0.50);
+      gainCampana.gain.setValueAtTime(0.22, ctx.currentTime + 0.50);
+      gainCampana.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.95);
+      campana.connect(gainCampana);
+      gainCampana.connect(ctx.destination);
+      campana.start(ctx.currentTime + 0.50);
+      campana.stop(ctx.currentTime + 0.96);
+      toast('🔊 Muestra: máquina de escribir con campana de retorno');
+    }
+  } catch (err) {
+    console.warn('Error al reproducir muestra sonora:', err);
+  }
+}
+
+function mandosTextoEnPantalla(valores, guardar, pid) {
+  const actual = Object.assign({
+    subtitulo_tam: 'normal',
+    subtitulo_caja: 'auto',
+    subtitulo_animacion: 'auto',
+    diseno: 'dibujo',
+    estilo_tecla: 'maquina'
+  }, valores || {});
+  const fila = (etiqueta, clave, opciones, ayuda) => h('div', { clase: 'texto-fila' },
+    h('span', { clase: 'texto-etiqueta', title: ayuda || '' }, etiqueta),
+    h('div', { clase: 'texto-opciones' }, ...opciones.map(([valor, nombre]) => h('button', {
+      clase: 'mini' + (String(actual[clave]) === String(valor) ? ' primario' : ' fantasma'),
+      onclick: () => guardar({ [clave]: valor }),
+    }, nombre))));
+
+  const filaSonido = h('div', { clase: 'texto-fila' },
+    h('span', { clase: 'texto-etiqueta', title: 'Sonido al teclear texto en las cartelas del vídeo' }, 'Efecto de tecleo'),
+    h('div', { clase: 'texto-opciones', style: 'display: flex; gap: 6px; align-items: center; flex-wrap: wrap;' },
+      ...TEXTO_ESTILOS_TECLADO.map(([valor, nombre]) => h('button', {
+        clase: 'mini' + (String(actual.estilo_tecla || 'maquina') === String(valor) ? ' primario' : ' fantasma'),
+        onclick: () => guardar({ estilo_tecla: valor }),
+      }, nombre)),
+      h('button', {
+        clase: 'mini',
+        style: 'border: 1px solid var(--acento); margin-left: 6px;',
+        title: 'Escuchar una muestra de cómo suena este efecto',
+        onclick: () => probarSonidoTecleo(actual.estilo_tecla || 'maquina', pid),
+      }, '🔊 Probar sonido')
+    ));
+
+  return h('div', { clase: 'texto-en-pantalla' },
+    fila('Tamaño', 'subtitulo_tam', TEXTO_TAMANOS),
+    fila('Caja detrás', 'subtitulo_caja', TEXTO_CAJAS,
+      'La franja oscura que hace legible el texto sobre cualquier imagen'),
+    fila('Entrada y salida', 'subtitulo_animacion', TEXTO_ANIMACIONES,
+      'Automática: fundido en horizontal y corte seco en vertical'),
+    fila('Diseño', 'diseno', TEXTO_DISENOS,
+      'El envoltorio del texto: esquinas, tipografía y peso'),
+    filaSonido);
+}
+
+/* En el estilo: se guarda en su grafismo y vale para los vídeos nuevos. */
+function bloqueTextoEstiloLight(ficha) {
+  const datos = ficha.datos || {};
+  return mandosTextoEnPantalla(datos.rotulos || {}, cambio => {
+    ficha.datos = Object.assign({}, datos, {
+      rotulos: Object.assign({}, datos.rotulos || {}, cambio) });
+    // se acumula con lo que esté pendiente de guardar: dos toques seguidos no
+    // pueden pisarse el uno al otro
+    const previo = ((APP.light.pendiente || {}).id === ficha.id
+      && (APP.light.pendiente || {}).texto) || {};
+    guardarPresetLight(ficha.id, { texto: Object.assign({}, previo, cambio) });
+    pintarLight();
+  });
+}
+
+/* En el vídeo abierto: van a sus rótulos y se ven al volver a montar. */
+function bloqueTextoVideoLight() {
+  const v = videoAbierto();
+  const ficha = (v && v.fichas && v.fichas.callouts) || {};
+  const render = (v && v.fichas && v.fichas.render) || {};
+  const valoresActuales = Object.assign({}, ficha.params || {}, {
+    estilo_tecla: (render.params || {}).estilo_tecla || 'maquina',
+  });
+
+  const caja = h('div', {});
+  caja.appendChild(mandosTextoEnPantalla(valoresActuales, async cambio => {
+    try {
+      if (cambio.estilo_tecla !== undefined) {
+        await pedir(API.sonido(v.pid), {
+          method: 'PUT',
+          cuerpo: { estilo_tecla: cambio.estilo_tecla }
+        });
+        if (!v.fichas.render) v.fichas.render = { params: {} };
+        if (!v.fichas.render.params) v.fichas.render.params = {};
+        v.fichas.render.params.estilo_tecla = cambio.estilo_tecla;
+        const nombreEstilo = cambio.estilo_tecla === 'silencio' ? 'Mudo / Silencioso' : (cambio.estilo_tecla === 'digital' ? 'Clic digital sutil' : 'Máquina mecánica');
+        toast(`Sonido de tecleo guardado: ${nombreEstilo}`);
+      }
+      const otrosCambios = Object.assign({}, cambio);
+      delete otrosCambios.estilo_tecla;
+      if (Object.keys(otrosCambios).length > 0) {
+        const r = await pedir(API.textoVideo(v.pid), { method: 'PUT', cuerpo: otrosCambios });
+        ficha.params = Object.assign({}, ficha.params || {}, r.params);
+        v.fichas.callouts = ficha;
+        toast('guardado: se verá al volver a montar el vídeo (no cuesta nada)');
+      }
+    } catch (e) {
+      toast(e.message, true);
+    }
+    pintarLight();
+  }, v.pid));
+  caja.appendChild(h('div', { clase: 'meta' },
+    'Cambia solo este vídeo. Para que se vea y escuche, pulsa «Montar el vídeo»: rehace '
+    + 'los rótulos, la mezcla de sonido y el MP4, sin tocar imágenes ni voz.'));
+  return plegable('✍️ Texto y sonido de cartelas en pantalla', {
+    clave: 'texto-video', resumen: 'tamaño, caja, diseño y sonido de tecleo de cartelas',
+  }, caja);
+}
+
+
 /* TODAS LAS DE ESTA PANTALLA, DE UNA VEZ. Es el mismo gesto que pulsar el boton
    de cada tarjeta, repetido: entran en la misma cola y salen de una en una. */
 function encolarTodasLasImagenes() {
@@ -8640,6 +10663,15 @@ function encolarTodasLasImagenes() {
 
 function encolarImagen(sid, texto, nid) {
   if (!sid) return;
+  /* CON FLOW NO HAY GENERADOR AL QUE MANDARLE LA NOTA: la cola volvería a
+     adoptar la misma imagen. Se rehace en Flow —la nota dice qué cambiar— y se
+     trae con «Importar de Flow». */
+  if (videoConFlow()) {
+    toast(`Con Flow, ${sid} se rehace en Flow: en el panel de la extensión elige `
+      + `${sid}, cambia el prompt según la nota, genérala, descárgala y pulsa `
+      + '«Importar de Flow».');
+    return;
+  }
   /* NO SE REPITE LA MISMA NOTA. Antes se miraba el plano, asi que una segunda
      nota sobre la misma imagen no entraba en la cola y pulsarla no hacia nada.
      Dos notas del mismo plano son dos peticiones: entran las dos y salen una
@@ -8805,12 +10837,13 @@ function irAlMomentoDeLaNota(nota) {
 }
 
 
-function listaDeNotas() {
+function listaDeNotas(notasCustom = null) {
   const r = estadoRepaso();
   const v = videoAbierto();
   const lista = h('div', { clase: 'repaso-notas' });
   const enPrevia = v.vista === 'previa';
-  notasDeAhora().forEach(nota => {
+  const coleccion = notasCustom !== null ? notasCustom : notasDeAhora();
+  coleccion.forEach(nota => {
     /* EDITANDO Y EN LAS DIAPOSITIVAS, manda el editor EN LINEA que ya existe
        (`filaNotaEscena`). El boton de editar de esta lista abre el panel del
        repaso, y ese panel solo se pinta en la pantalla del video: desde aqui
@@ -9495,6 +11528,10 @@ function vistaPresetLight() {
     sliderRitmo((ficha.origen_ritmo || ritmoPorDefecto()),
       v => guardarPresetLight(ficha.id, { ritmo: v }))));
 
+  // ✍️ el texto en pantalla: tampoco rehace nada, vale para los vídeos nuevos
+  caja.appendChild(bloqueLight('✍️ Texto en pantalla', 'cómo se ven los subtítulos',
+    bloqueTextoEstiloLight(ficha)));
+
   // 🎙️ la voz, con su escucha
   const voz = h('div', {});
   voz.appendChild(escuchaDeVoz(ficha));
@@ -9733,6 +11770,7 @@ function vocesLight(idioma) {
    color, pero la voz es esa. Sin ninguna en la cuenta se dice, en una línea,
    que no hay: es la forma de que nadie busque en el catálogo lo que no está. */
 function selectorVozPropiaLight(e) {
+  if (vozConElevenLabs()) return h('div', { clase: 'campo' }, avisoVozElevenLabs());
   const lista = vocesLight(e.idioma);
   const caja = h('div', { clase: 'campo' });
   if (!lista) {
@@ -9762,6 +11800,7 @@ function selectorVozPropiaLight(e) {
 }
 
 function selectorVozLight(ficha, voz, voces, guardar) {
+  if (vozConElevenLabs()) return avisoVozElevenLabs();
   const estado = (APP.light.picker && APP.light.picker.preset === ficha.id)
     ? APP.light.picker
     : (APP.light.picker = { preset: ficha.id, abierto: false, busca: '' });

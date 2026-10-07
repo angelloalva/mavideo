@@ -432,7 +432,9 @@ def generar(referencias, estilo, ejes=None, peticiones=None, calidad="medium",
     cualquier video que lo use, asi que ahorrar aqui es ahorrar en el sitio
     equivocado.
     """
-    imagen = medios.motor("imagen_openai/imagen.py")
+    # el motor del ajuste de imagenes (OpenAI o Vertex): una lamina de estilo
+    # no es de ningun video, asi que manda lo que este puesto para los nuevos
+    imagen = medios.motor_de_imagen()
     reglas = medios.motor("reglas/reglas.py")
     avisar = avisar or (lambda *a, **k: None)
     rutas = [r for r in (referencias or []) if os.path.exists(r)]
@@ -682,7 +684,9 @@ def dibujar_desde_guia(estilo, destino, ejes=None, calidad="medium",
     lamina con su descripcion generica de siempre, pagaba la imagen y devolvia
     otra vez lo mismo, con la correccion dada por aplicada.
     """
-    imagen = medios.motor("imagen_openai/imagen.py")
+    # el motor del ajuste de imagenes (OpenAI o Vertex): una lamina de estilo
+    # no es de ningun video, asi que manda lo que este puesto para los nuevos
+    imagen = medios.motor_de_imagen()
     reglas = medios.motor("reglas/reglas.py")
     avisar = avisar or (lambda *a, **k: None)
     pedidos = [e for e in (ejes or EJES) if e in EJES]

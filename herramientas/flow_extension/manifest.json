@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Estudio → Flow",
+  "version": "0.2.0",
+  "description": "Enseña plano a plano los prompts de un video del Estudio y guarda la siguiente descarga de Flow con el nombre del plano. Pegar, generar y descargar lo hace la persona.",
+  "permissions": ["storage", "downloads"],
+  "background": {"service_worker": "fondo.js"},
+  "content_scripts": [
+    {
+      "matches": ["https://flow.google.com/*"],
+      "js": ["panel.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

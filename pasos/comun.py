@@ -99,13 +99,23 @@ def llamar_motor(funcion, *args, **kwargs):
 def preparar_trabajo(proyecto, paso_id):
     """Devuelve la carpeta de trabajo del paso, vacia.
 
-    Se borra lo que hubiera de una ejecucion fallida anterior: varios motores
+    Se vacia lo que hubiera de una ejecucion fallida anterior: varios motores
     buscan ficheros por extension dentro de la carpeta y encontrarian restos.
+    En Windows / OneDrive nunca se borra la carpeta raiz de trabajo (da WinError 5
+    Acceso denegado por bloqueos del sistema o sincronizacion); se vacia por dentro.
     """
-    destino = proyecto.ruta_trabajo(paso_id, crear=False)
+    destino = proyecto.ruta_trabajo(paso_id, crear=True)
     if os.path.isdir(destino):
-        shutil.rmtree(destino)
-    return proyecto.ruta_trabajo(paso_id, crear=True)
+        for nombre in os.listdir(destino):
+            ruta = os.path.join(destino, nombre)
+            try:
+                if os.path.isdir(ruta):
+                    shutil.rmtree(ruta, ignore_errors=True)
+                else:
+                    os.remove(ruta)
+            except Exception:
+                pass
+    return destino
 
 
 def carpeta_activa(proyecto, paso_id):

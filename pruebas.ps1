@@ -57,6 +57,13 @@ if (Test-Path $sucio) {
 # la barra dejen de usar la tabla escrita y usen lo medido de esta maquina.
 $env:ESTUDIO_ESTADISTICAS = Join-Path $env:TEMP 'estudio_pruebas_estadisticas.json'
 Remove-Item -Force $env:ESTUDIO_ESTADISTICAS -ErrorAction SilentlyContinue
+# ElevenLabs (secretos/elevenlabs.json) apagado en las pruebas: no gastan sus creditos
+$env:ESTUDIO_SIN_ELEVENLABS = "1"
+# Y LOS AJUSTES, A UNA COPIA LIMPIA: con «Imagenes: Google Flow» puesto en el
+# ajustes.json de verdad, las suites que crean estilos o videos correrian en
+# modo Flow (sin laminas, adoptando) y fallarian por la maquina, no por el codigo.
+$env:ESTUDIO_AJUSTES = Join-Path $env:TEMP 'estudio_pruebas_ajustes.json'
+Remove-Item -Force $env:ESTUDIO_AJUSTES -ErrorAction SilentlyContinue
 
 $suites = @(
   'prueba_api.py', 'prueba_coste_capturas.py',

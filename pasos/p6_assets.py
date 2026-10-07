@@ -69,6 +69,7 @@ import corrector  # noqa: E402
 import cta  # noqa: E402
 import encuadres  # noqa: E402
 import estadisticas  # noqa: E402
+import flow  # noqa: E402
 import medios  # noqa: E402
 import moodboard  # noqa: E402
 # p2_brief por su tabla de nombres de idioma (la del generador de imagen va en
@@ -129,7 +130,7 @@ PARAMS_POR_DEFECTO = {
     # persona; a partir de ahi es un dato. QUE PLANTILLAS puede usar vive en los
     # params de rotulos, junto al resto del grafismo.
     "semilla": 7,
-    "motor_imagen": "openai",          # openai | adoptar
+    "motor_imagen": "openai",          # openai | vertex | adoptar
     "imagenes_previas": [],            # carpetas de arte ya aprobado
     # Fotogramas REALES del video de referencia, aprobados a mano, para que el
     # dibujo de una persona o un sitio concreto se parezca al original. Vacio en
@@ -174,6 +175,8 @@ def describir(params):
     p = _con_defectos(params)
     catalogo = p["catalogo"] or {}
     motor = ("adoptando arte ya existente" if p["motor_imagen"] == "adoptar"
+             else "generando con Nano Banana en Google Vertex"
+             if p["motor_imagen"] == "vertex"
              else f"generando con gpt-image-2 en calidad {p['calidad']}")
     encuadre = ("asigna a cada plano su clase de encuadre en texto "
                 "(caben diagramas y pantallas)")
@@ -1298,6 +1301,17 @@ def planificar(proyecto, params, inventario=None, replantear=False,
         if beat.get("tono"):
             escena["tono"] = str(beat["tono"]).strip()
         escena["prompt"] = _prompt_visual(escena, beat, catalogo)
+        ajustes_u = _ajustes_unidad(p, f"escena:{escena['id']}")
+        if ajustes_u.get("prompt"):
+            escena["prompt"] = str(ajustes_u["prompt"]).strip()
+            escena["prompt_editado"] = True
+        elif (previo or {}).get("escenas"):
+            prev_e = next((pe for pe in previo.get("escenas", [])
+                           if pe.get("id") == escena["id"]
+                           and pe.get("narracion") == escena.get("narracion")), None)
+            if prev_e and prev_e.get("prompt_editado"):
+                escena["prompt"] = prev_e["prompt"]
+                escena["prompt_editado"] = True
         entra = bool(escena["set"]) and escena["set"] != set_anterior
         nuevos = [q for q in (escena.get("personajes") or []) if q not in presentados]
         presentados.update(nuevos)
@@ -1315,6 +1329,53 @@ def planificar(proyecto, params, inventario=None, replantear=False,
     # hay cabeceras de sitio. Lo que sigue estirando --y ahora fundiendo-- son
     # las CARTELAS, y eso lo descuenta `_marcar_cartelas` mas arriba.
     informe["estirados"] = []
+
+    # Emparejar escenas con clips de video Flow si existen en el guion/material
+    try:
+        material_texto = ""
+        if hasattr(proyecto, "ruta_paso"):
+            try:
+                r_ingesta = proyecto.ruta_paso("ingesta")
+                if r_ingesta and os.path.isdir(r_ingesta):
+                    f_mat = os.path.join(r_ingesta, "material.txt")
+                    if os.path.isfile(f_mat):
+                        with open(f_mat, encoding="utf-8") as fh:
+                            material_texto = fh.read()
+            except Exception:
+                pass
+        if not material_texto and hasattr(proyecto, "raiz"):
+            dir_ing = os.path.join(proyecto.raiz, "pasos", "ingesta")
+            if os.path.isdir(dir_ing):
+                for sub in os.listdir(dir_ing):
+                    f_mat = os.path.join(dir_ing, sub, "material.txt")
+                    if os.path.isfile(f_mat):
+                        with open(f_mat, encoding="utf-8") as fh:
+                            material_texto = fh.read()
+                        if material_texto:
+                            break
+        if not material_texto and hasattr(proyecto, "raiz"):
+            for nom in ("material.txt", "ingesta.txt", "guion.txt"):
+                f_alt = os.path.join(proyecto.raiz, nom)
+                if os.path.isfile(f_alt):
+                    with open(f_alt, encoding="utf-8") as fh:
+                        material_texto = fh.read()
+                    if material_texto:
+                        break
+
+        clips_flow = flow.extraer_clips_flow_del_material(material_texto)
+        if clips_flow:
+            flow.emparejar_escenas_con_flow(escenas, clips_flow)
+            if hasattr(proyecto, "raiz"):
+                flow.exportar_prompts_video(proyecto.raiz, material_texto, escenas)
+
+        if hasattr(proyecto, "raiz"):
+            for esc in escenas:
+                vid = flow.buscar_video_de_escena(proyecto.raiz, esc["id"], flow_num=esc.get("flow_num"))
+                if vid:
+                    esc["video_manual"] = True
+                    esc["tipo_visual"] = "flow_video"
+    except Exception:
+        pass
 
     plan = {
         "proyecto": proyecto.id,
@@ -2933,7 +2994,7 @@ def _adoptar(nombre, p, firma=None, subcarpetas=("", "escenas", "storyboard", "r
 
 
 def _producir_imagen(nombre, prompt, referencias, destino, p, rehacer=False,
-                     tamano=None):
+                     tamano=None, avisar=None):
     """Arte adoptado -> cache -> API. Devuelve como se resolvio y el coste.
 
     'rehacer' es el boton de "esta no me gusta": salta el arte adoptado y la
@@ -2973,15 +3034,30 @@ def _producir_imagen(nombre, prompt, referencias, destino, p, rehacer=False,
             medios.copiar(cacheada, destino)
             return {"origen": "cache", "firma": firma, "coste": 0.0}
 
-    imagen = medios.motor("imagen_openai/imagen.py")
+    # el motor del PROYECTO, no el ajuste: un video empezado con OpenAI sigue
+    # con OpenAI aunque los nuevos se hagan con Vertex
+    imagen = medios.motor_de_imagen(p["motor_imagen"])
     try:
-        png, meta = imagen.generar(prompt, referencias, quality=p["calidad"],
-                                   tamano=tamano)
+        kwargs = {"quality": p["calidad"], "tamano": tamano}
+        if p["motor_imagen"] == "vertex" and callable(avisar):
+            def avisar_motor(_prog, msg):
+                try:
+                    avisar(None, f"{msg}:{nombre}")
+                except Exception:
+                    pass
+            kwargs["avisar"] = avisar_motor
+        png, meta = imagen.generar(prompt, referencias, **kwargs)
     except SystemExit as fallo:
         # el motor esta escrito como CLI y aborta con SystemExit (por ejemplo si
         # falta la clave); dentro de un hilo eso no lo captura nadie y el paso
         # se quedaria colgado en 'ejecutando' sin explicacion
         raise RuntimeError(f"el motor de imagen aborto: {fallo}") from fallo
+    except Exception as fallo:
+        raise RuntimeError(
+            f"Plano {nombre}: {fallo}\n\n"
+            f"Cómo solucionarlo: ve a la parada «Imágenes», busca la escena {nombre} "
+            f"y escribe una nota en el recuadro «¿Qué cambiarías de {nombre}?», o ajusta su prompt."
+        ) from fallo
     os.makedirs(os.path.dirname(destino), exist_ok=True)
     with open(destino, "wb") as fh:
         fh.write(png)
@@ -3336,6 +3412,22 @@ def _generar_escenas(plan, dirs, p, trabajo, toca, unidades, resultados, avisar,
                 meta = {"origen": "componente", "coste": 0.0}
                 prompt = ""
                 referencias = []
+            elif flow.buscar_video_de_escena(getattr(proyecto, "raiz", None), sid, flow_num=escena.get("flow_num")):
+                vid = flow.buscar_video_de_escena(getattr(proyecto, "raiz", None), sid, flow_num=escena.get("flow_num"))
+                if not os.path.exists(destino) or pedida:
+                    try:
+                        cmd = [medios.ffmpeg(), "-y", "-ss", "0", "-i", vid, "-vframes", "1", destino]
+                        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                    except Exception:
+                        pass
+                meta = {
+                    "origen": "flow_video",
+                    "coste": 0.0,
+                    "video": os.path.relpath(vid, trabajo) if getattr(proyecto, "raiz", None) else vid,
+                    "flow_num": escena.get("flow_num"),
+                }
+                prompt = escena.get("flow_prompt") or escena.get("prompt") or ""
+                referencias = []
             else:
                 # La cadena manda siempre, tambien en fila: es el orden DEL PLAN
                 # dentro de ese sitio, y comparando ids no lo era -- los ids se
@@ -3346,7 +3438,10 @@ def _generar_escenas(plan, dirs, p, trabajo, toca, unidades, resultados, avisar,
                     anteriores=orden_cadena, notas=notas_repaso)
                 nota_texto = _texto_feedback(
                     _ajustes_unidad(p, uid).get("feedback"))
-                escena_final = escena
+                escena_final = dict(escena)
+                ajustes_u = _ajustes_unidad(p, uid)
+                if ajustes_u.get("prompt"):
+                    escena_final["prompt"] = str(ajustes_u["prompt"]).strip()
                 corregido = None
                 # EL CORRECTOR, solo cuando hay nota y alguien ha pedido rehacer
                 # ESTE plano: es una llamada al CLI por imagen, y una tanda
@@ -3400,7 +3495,8 @@ def _generar_escenas(plan, dirs, p, trabajo, toca, unidades, resultados, avisar,
                                         # plano vertical se PIDE vertical, no
                                         # se recorta de uno apaisado
                                         tamano=p2_brief.comun.ficha_formato(
-                                            plan.get("formato"))["tamano_imagen"])
+                                            plan.get("formato"))["tamano_imagen"],
+                                        avisar=avisar)
                 if corregido:
                     meta = dict(meta, corrector={
                         k: corregido.get(k) for k in
@@ -3543,7 +3639,10 @@ def _planos_repetidos(resultados, trabajo, copiados=()):
         if ficha.get("tipo") != "escena" or not ficha.get("png"):
             continue
         sid = ficha.get("id") or str(uid).split(":", 1)[-1]
-        if ficha.get("origen") in ("cartela", "sigue") \
+        if ficha.get("origen") in ("cartela", "sigue", "flow_video") \
+                or ficha.get("video") \
+                or ficha.get("flow_num") \
+                or ficha.get("tipo_visual") == "flow_video" \
                 or sid in copiados or ficha.get("sigue_a"):
             continue
         ruta = os.path.join(trabajo, ficha["png"])
@@ -4334,7 +4433,8 @@ def ejecutar(proyecto, params, avisar=None, unidades=None, solo_assets=False,
                     p, dirs["cache"], {"personajes": [ficha["nombre"]]})]
                 meta = _producir_imagen(ficha["nombre"], prompt, refs, destino, p,
                                         rehacer=((rehacer or unidades is not None)
-                                                 and os.path.exists(destino)))
+                                                 and os.path.exists(destino)),
+                                        avisar=avisar)
                 resultados[uid] = {"tipo": "reparto",
                                    "png": os.path.relpath(destino, trabajo), **meta}
             else:
@@ -4414,7 +4514,10 @@ def ejecutar(proyecto, params, avisar=None, unidades=None, solo_assets=False,
     # una toma que dura mas copia la del hogar, y tiene que ser identica.
     repetidos = _planos_repetidos(
         resultados, trabajo,
-        copiados={e["id"] for e in escenas if e.get("sigue_a")})
+        copiados={e["id"] for e in escenas if e.get("sigue_a")
+                  or e.get("tipo_visual") == "flow_video"
+                  or e.get("flow_num")
+                  or e.get("video_manual")})
     if repetidos:
         detalle = "; ".join(" = ".join(grupo) for grupo in repetidos)
         # Al generar, dos planos con la misma imagen siempre es un fallo: significa
